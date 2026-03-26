@@ -590,6 +590,17 @@
   
 </li>
         
+          <li class="md-nav__item">
+  <a href="#typescript-sdk" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        TypeScript SDK
+      
+    </span>
+  </a>
+  
+</li>
+        
       </ul>
     </nav>
   
@@ -2176,6 +2187,17 @@
   
 </li>
         
+          <li class="md-nav__item">
+  <a href="#typescript-sdk" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        TypeScript SDK
+      
+    </span>
+  </a>
+  
+</li>
+        
       </ul>
     </nav>
   
@@ -2433,7 +2455,7 @@
 <p>Headroom works as a <strong>transparent proxy</strong> (zero code changes), a <strong>Python function</strong> (<code>compress()</code>), or a <strong>framework integration</strong> (LangChain, Agno, Strands, LiteLLM, MCP).</p>
 <hr />
 <h2 id="quick-start">Quick Start<a class="headerlink" href="#quick-start" title="Permanent link">&para;</a></h2>
-<div class="tabbed-set tabbed-alternate" data-tabs="1:4"><input checked="checked" id="__tabbed_1_1" name="__tabbed_1" type="radio" /><input id="__tabbed_1_2" name="__tabbed_1" type="radio" /><input id="__tabbed_1_3" name="__tabbed_1" type="radio" /><input id="__tabbed_1_4" name="__tabbed_1" type="radio" /><div class="tabbed-labels"><label for="__tabbed_1_1">Proxy (Zero Code Changes)</label><label for="__tabbed_1_2">Python SDK</label><label for="__tabbed_1_3">Coding Agents</label><label for="__tabbed_1_4">LiteLLM Callback</label></div>
+<div class="tabbed-set tabbed-alternate" data-tabs="1:5"><input checked="checked" id="__tabbed_1_1" name="__tabbed_1" type="radio" /><input id="__tabbed_1_2" name="__tabbed_1" type="radio" /><input id="__tabbed_1_3" name="__tabbed_1" type="radio" /><input id="__tabbed_1_4" name="__tabbed_1" type="radio" /><input id="__tabbed_1_5" name="__tabbed_1" type="radio" /><div class="tabbed-labels"><label for="__tabbed_1_1">Proxy (Zero Code Changes)</label><label for="__tabbed_1_2">Python SDK</label><label for="__tabbed_1_3">Coding Agents</label><label for="__tabbed_1_4">TypeScript SDK</label><label for="__tabbed_1_5">LiteLLM Callback</label></div>
 <div class="tabbed-content">
 <div class="tabbed-block">
 <div class="language-bash highlight"><pre><span></span><code><span id="__span-1-1"><a id="__codelineno-1-1" name="__codelineno-1-1" href="#__codelineno-1-1"></a>pip<span class="w"> </span>install<span class="w"> </span><span class="s2">&quot;headroom-ai[all]&quot;</span>
@@ -2466,11 +2488,20 @@
 <p>Starts the proxy, points your tool at it, compresses everything automatically.</p>
 </div>
 <div class="tabbed-block">
-<div class="language-python highlight"><pre><span></span><code><span id="__span-5-1"><a id="__codelineno-5-1" name="__codelineno-5-1" href="#__codelineno-5-1"></a><span class="kn">import</span><span class="w"> </span><span class="nn">litellm</span>
-</span><span id="__span-5-2"><a id="__codelineno-5-2" name="__codelineno-5-2" href="#__codelineno-5-2"></a><span class="kn">from</span><span class="w"> </span><span class="nn">headroom.integrations.litellm_callback</span><span class="w"> </span><span class="kn">import</span> <span class="n">HeadroomCallback</span>
-</span><span id="__span-5-3"><a id="__codelineno-5-3" name="__codelineno-5-3" href="#__codelineno-5-3"></a>
-</span><span id="__span-5-4"><a id="__codelineno-5-4" name="__codelineno-5-4" href="#__codelineno-5-4"></a><span class="n">litellm</span><span class="o">.</span><span class="n">callbacks</span> <span class="o">=</span> <span class="p">[</span><span class="n">HeadroomCallback</span><span class="p">()]</span>
-</span><span id="__span-5-5"><a id="__codelineno-5-5" name="__codelineno-5-5" href="#__codelineno-5-5"></a><span class="c1"># All 100+ providers now compressed automatically</span>
+<div class="language-typescript highlight"><pre><span></span><code><span id="__span-5-1"><a id="__codelineno-5-1" name="__codelineno-5-1" href="#__codelineno-5-1"></a><span class="k">import</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="nx">compress</span><span class="w"> </span><span class="p">}</span><span class="w"> </span><span class="kr">from</span><span class="w"> </span><span class="s1">&#39;headroom-ai&#39;</span><span class="p">;</span>
+</span><span id="__span-5-2"><a id="__codelineno-5-2" name="__codelineno-5-2" href="#__codelineno-5-2"></a>
+</span><span id="__span-5-3"><a id="__codelineno-5-3" name="__codelineno-5-3" href="#__codelineno-5-3"></a><span class="kd">const</span><span class="w"> </span><span class="nx">result</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="k">await</span><span class="w"> </span><span class="nx">compress</span><span class="p">(</span><span class="nx">messages</span><span class="p">,</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="nx">model</span><span class="o">:</span><span class="w"> </span><span class="s1">&#39;claude-sonnet-4-5-20250929&#39;</span><span class="w"> </span><span class="p">});</span>
+</span><span id="__span-5-4"><a id="__codelineno-5-4" name="__codelineno-5-4" href="#__codelineno-5-4"></a><span class="c1">// Use result.messages with any LLM client</span>
+</span><span id="__span-5-5"><a id="__codelineno-5-5" name="__codelineno-5-5" href="#__codelineno-5-5"></a><span class="nx">console</span><span class="p">.</span><span class="nx">log</span><span class="p">(</span><span class="sb">`Saved </span><span class="si">${</span><span class="nx">result</span><span class="p">.</span><span class="nx">tokensSaved</span><span class="si">}</span><span class="sb"> tokens`</span><span class="p">);</span>
+</span></code></pre></div>
+<p>Works with Vercel AI SDK, OpenAI Node SDK, and Anthropic TS SDK. <a href="typescript-sdk/">Full TS guide &rarr;</a></p>
+</div>
+<div class="tabbed-block">
+<div class="language-python highlight"><pre><span></span><code><span id="__span-6-1"><a id="__codelineno-6-1" name="__codelineno-6-1" href="#__codelineno-6-1"></a><span class="kn">import</span><span class="w"> </span><span class="nn">litellm</span>
+</span><span id="__span-6-2"><a id="__codelineno-6-2" name="__codelineno-6-2" href="#__codelineno-6-2"></a><span class="kn">from</span><span class="w"> </span><span class="nn">headroom.integrations.litellm_callback</span><span class="w"> </span><span class="kn">import</span> <span class="n">HeadroomCallback</span>
+</span><span id="__span-6-3"><a id="__codelineno-6-3" name="__codelineno-6-3" href="#__codelineno-6-3"></a>
+</span><span id="__span-6-4"><a id="__codelineno-6-4" name="__codelineno-6-4" href="#__codelineno-6-4"></a><span class="n">litellm</span><span class="o">.</span><span class="n">callbacks</span> <span class="o">=</span> <span class="p">[</span><span class="n">HeadroomCallback</span><span class="p">()]</span>
+</span><span id="__span-6-5"><a id="__codelineno-6-5" name="__codelineno-6-5" href="#__codelineno-6-5"></a><span class="c1"># All 100+ providers now compressed automatically</span>
 </span></code></pre></div>
 </div>
 </div>
@@ -2481,38 +2512,45 @@
 <div class="grid-item">
 <h3 id="langchain">LangChain<a class="headerlink" href="#langchain" title="Permanent link">&para;</a></h3>
 <p>Wrap any chat model. Supports memory, retrievers, tools, streaming, async.</p>
-<div class="language-python highlight"><pre><span></span><code><span id="__span-6-1"><a id="__codelineno-6-1" name="__codelineno-6-1" href="#__codelineno-6-1"></a><span class="kn">from</span><span class="w"> </span><span class="nn">headroom.integrations</span><span class="w"> </span><span class="kn">import</span> <span class="n">HeadroomChatModel</span>
-</span><span id="__span-6-2"><a id="__codelineno-6-2" name="__codelineno-6-2" href="#__codelineno-6-2"></a>
-</span><span id="__span-6-3"><a id="__codelineno-6-3" name="__codelineno-6-3" href="#__codelineno-6-3"></a><span class="n">llm</span> <span class="o">=</span> <span class="n">HeadroomChatModel</span><span class="p">(</span><span class="n">ChatOpenAI</span><span class="p">(</span><span class="n">model</span><span class="o">=</span><span class="s2">&quot;gpt-4o&quot;</span><span class="p">))</span>
+<div class="language-python highlight"><pre><span></span><code><span id="__span-7-1"><a id="__codelineno-7-1" name="__codelineno-7-1" href="#__codelineno-7-1"></a><span class="kn">from</span><span class="w"> </span><span class="nn">headroom.integrations</span><span class="w"> </span><span class="kn">import</span> <span class="n">HeadroomChatModel</span>
+</span><span id="__span-7-2"><a id="__codelineno-7-2" name="__codelineno-7-2" href="#__codelineno-7-2"></a>
+</span><span id="__span-7-3"><a id="__codelineno-7-3" name="__codelineno-7-3" href="#__codelineno-7-3"></a><span class="n">llm</span> <span class="o">=</span> <span class="n">HeadroomChatModel</span><span class="p">(</span><span class="n">ChatOpenAI</span><span class="p">(</span><span class="n">model</span><span class="o">=</span><span class="s2">&quot;gpt-4o&quot;</span><span class="p">))</span>
 </span></code></pre></div>
 <p><a href="langchain/">LangChain Guide &rarr;</a></p>
 </div>
 <div class="grid-item">
 <h3 id="agno">Agno<a class="headerlink" href="#agno" title="Permanent link">&para;</a></h3>
 <p>Full agent framework integration with observability hooks.</p>
-<div class="language-python highlight"><pre><span></span><code><span id="__span-7-1"><a id="__codelineno-7-1" name="__codelineno-7-1" href="#__codelineno-7-1"></a><span class="kn">from</span><span class="w"> </span><span class="nn">headroom.integrations.agno</span><span class="w"> </span><span class="kn">import</span> <span class="n">HeadroomAgnoModel</span>
-</span><span id="__span-7-2"><a id="__codelineno-7-2" name="__codelineno-7-2" href="#__codelineno-7-2"></a>
-</span><span id="__span-7-3"><a id="__codelineno-7-3" name="__codelineno-7-3" href="#__codelineno-7-3"></a><span class="n">model</span> <span class="o">=</span> <span class="n">HeadroomAgnoModel</span><span class="p">(</span><span class="n">Claude</span><span class="p">(</span><span class="nb">id</span><span class="o">=</span><span class="s2">&quot;claude-sonnet-4-20250514&quot;</span><span class="p">))</span>
-</span><span id="__span-7-4"><a id="__codelineno-7-4" name="__codelineno-7-4" href="#__codelineno-7-4"></a><span class="n">agent</span> <span class="o">=</span> <span class="n">Agent</span><span class="p">(</span><span class="n">model</span><span class="o">=</span><span class="n">model</span><span class="p">)</span>
+<div class="language-python highlight"><pre><span></span><code><span id="__span-8-1"><a id="__codelineno-8-1" name="__codelineno-8-1" href="#__codelineno-8-1"></a><span class="kn">from</span><span class="w"> </span><span class="nn">headroom.integrations.agno</span><span class="w"> </span><span class="kn">import</span> <span class="n">HeadroomAgnoModel</span>
+</span><span id="__span-8-2"><a id="__codelineno-8-2" name="__codelineno-8-2" href="#__codelineno-8-2"></a>
+</span><span id="__span-8-3"><a id="__codelineno-8-3" name="__codelineno-8-3" href="#__codelineno-8-3"></a><span class="n">model</span> <span class="o">=</span> <span class="n">HeadroomAgnoModel</span><span class="p">(</span><span class="n">Claude</span><span class="p">(</span><span class="nb">id</span><span class="o">=</span><span class="s2">&quot;claude-sonnet-4-20250514&quot;</span><span class="p">))</span>
+</span><span id="__span-8-4"><a id="__codelineno-8-4" name="__codelineno-8-4" href="#__codelineno-8-4"></a><span class="n">agent</span> <span class="o">=</span> <span class="n">Agent</span><span class="p">(</span><span class="n">model</span><span class="o">=</span><span class="n">model</span><span class="p">)</span>
 </span></code></pre></div>
 <p><a href="agno/">Agno Guide &rarr;</a></p>
 </div>
 <div class="grid-item">
 <h3 id="strands">Strands<a class="headerlink" href="#strands" title="Permanent link">&para;</a></h3>
 <p>Model wrapping + tool output hook provider for Strands Agents.</p>
-<div class="language-python highlight"><pre><span></span><code><span id="__span-8-1"><a id="__codelineno-8-1" name="__codelineno-8-1" href="#__codelineno-8-1"></a><span class="kn">from</span><span class="w"> </span><span class="nn">headroom.integrations.strands</span><span class="w"> </span><span class="kn">import</span> <span class="n">HeadroomStrandsModel</span>
-</span><span id="__span-8-2"><a id="__codelineno-8-2" name="__codelineno-8-2" href="#__codelineno-8-2"></a>
-</span><span id="__span-8-3"><a id="__codelineno-8-3" name="__codelineno-8-3" href="#__codelineno-8-3"></a><span class="n">model</span> <span class="o">=</span> <span class="n">HeadroomStrandsModel</span><span class="p">(</span><span class="n">wrapped_model</span><span class="o">=</span><span class="n">bedrock_model</span><span class="p">)</span>
-</span><span id="__span-8-4"><a id="__codelineno-8-4" name="__codelineno-8-4" href="#__codelineno-8-4"></a><span class="n">agent</span> <span class="o">=</span> <span class="n">Agent</span><span class="p">(</span><span class="n">model</span><span class="o">=</span><span class="n">model</span><span class="p">)</span>
+<div class="language-python highlight"><pre><span></span><code><span id="__span-9-1"><a id="__codelineno-9-1" name="__codelineno-9-1" href="#__codelineno-9-1"></a><span class="kn">from</span><span class="w"> </span><span class="nn">headroom.integrations.strands</span><span class="w"> </span><span class="kn">import</span> <span class="n">HeadroomStrandsModel</span>
+</span><span id="__span-9-2"><a id="__codelineno-9-2" name="__codelineno-9-2" href="#__codelineno-9-2"></a>
+</span><span id="__span-9-3"><a id="__codelineno-9-3" name="__codelineno-9-3" href="#__codelineno-9-3"></a><span class="n">model</span> <span class="o">=</span> <span class="n">HeadroomStrandsModel</span><span class="p">(</span><span class="n">wrapped_model</span><span class="o">=</span><span class="n">bedrock_model</span><span class="p">)</span>
+</span><span id="__span-9-4"><a id="__codelineno-9-4" name="__codelineno-9-4" href="#__codelineno-9-4"></a><span class="n">agent</span> <span class="o">=</span> <span class="n">Agent</span><span class="p">(</span><span class="n">model</span><span class="o">=</span><span class="n">model</span><span class="p">)</span>
 </span></code></pre></div>
 <p><a href="strands/">Strands Guide &rarr;</a></p>
 </div>
 <div class="grid-item">
 <h3 id="mcp-tools">MCP Tools<a class="headerlink" href="#mcp-tools" title="Permanent link">&para;</a></h3>
 <p>Three tools for Claude Code, Cursor, or any MCP client: <code>headroom_compress</code>, <code>headroom_retrieve</code>, <code>headroom_stats</code>.</p>
-<div class="language-bash highlight"><pre><span></span><code><span id="__span-9-1"><a id="__codelineno-9-1" name="__codelineno-9-1" href="#__codelineno-9-1"></a>headroom<span class="w"> </span>mcp<span class="w"> </span>install<span class="w"> </span><span class="o">&amp;&amp;</span><span class="w"> </span>claude
+<div class="language-bash highlight"><pre><span></span><code><span id="__span-10-1"><a id="__codelineno-10-1" name="__codelineno-10-1" href="#__codelineno-10-1"></a>headroom<span class="w"> </span>mcp<span class="w"> </span>install<span class="w"> </span><span class="o">&amp;&amp;</span><span class="w"> </span>claude
 </span></code></pre></div>
 <p><a href="mcp/">MCP Guide &rarr;</a></p>
+</div>
+<div class="grid-item">
+<h3 id="typescript-sdk">TypeScript SDK<a class="headerlink" href="#typescript-sdk" title="Permanent link">&para;</a></h3>
+<p><code>compress()</code>, Vercel AI SDK middleware, OpenAI and Anthropic client wrappers.</p>
+<div class="language-bash highlight"><pre><span></span><code><span id="__span-11-1"><a id="__codelineno-11-1" name="__codelineno-11-1" href="#__codelineno-11-1"></a>npm<span class="w"> </span>install<span class="w"> </span>headroom-ai
+</span></code></pre></div>
+<p><a href="typescript-sdk/">TypeScript SDK Guide &rarr;</a></p>
 </div>
 </div>
 <p><a class="md-button" href="integration-guide/">All integration patterns &rarr;</a></p>
@@ -2733,9 +2771,9 @@
 <div class="grid-item">
 <h3 id="multi-agent-context">Multi-Agent Context<a class="headerlink" href="#multi-agent-context" title="Permanent link">&para;</a></h3>
 <p>Compress what moves between agents. Any framework.
-<div class="language-python highlight"><pre><span></span><code><span id="__span-10-1"><a id="__codelineno-10-1" name="__codelineno-10-1" href="#__codelineno-10-1"></a><span class="n">ctx</span> <span class="o">=</span> <span class="n">SharedContext</span><span class="p">()</span>
-</span><span id="__span-10-2"><a id="__codelineno-10-2" name="__codelineno-10-2" href="#__codelineno-10-2"></a><span class="n">ctx</span><span class="o">.</span><span class="n">put</span><span class="p">(</span><span class="s2">&quot;research&quot;</span><span class="p">,</span> <span class="n">big_output</span><span class="p">)</span>
-</span><span id="__span-10-3"><a id="__codelineno-10-3" name="__codelineno-10-3" href="#__codelineno-10-3"></a><span class="n">summary</span> <span class="o">=</span> <span class="n">ctx</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">&quot;research&quot;</span><span class="p">)</span>  <span class="c1"># ~80% smaller</span>
+<div class="language-python highlight"><pre><span></span><code><span id="__span-12-1"><a id="__codelineno-12-1" name="__codelineno-12-1" href="#__codelineno-12-1"></a><span class="n">ctx</span> <span class="o">=</span> <span class="n">SharedContext</span><span class="p">()</span>
+</span><span id="__span-12-2"><a id="__codelineno-12-2" name="__codelineno-12-2" href="#__codelineno-12-2"></a><span class="n">ctx</span><span class="o">.</span><span class="n">put</span><span class="p">(</span><span class="s2">&quot;research&quot;</span><span class="p">,</span> <span class="n">big_output</span><span class="p">)</span>
+</span><span id="__span-12-3"><a id="__codelineno-12-3" name="__codelineno-12-3" href="#__codelineno-12-3"></a><span class="n">summary</span> <span class="o">=</span> <span class="n">ctx</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">&quot;research&quot;</span><span class="p">)</span>  <span class="c1"># ~80% smaller</span>
 </span></code></pre></div>
 <a href="shared-context/">Learn more &rarr;</a></p>
 </div>
@@ -2748,22 +2786,23 @@
 <hr />
 <h2 id="cloud-providers">Cloud Providers<a class="headerlink" href="#cloud-providers" title="Permanent link">&para;</a></h2>
 <p>Works with any LLM provider out of the box:</p>
-<div class="language-bash highlight"><pre><span></span><code><span id="__span-11-1"><a id="__codelineno-11-1" name="__codelineno-11-1" href="#__codelineno-11-1"></a>headroom<span class="w"> </span>proxy<span class="w">                                          </span><span class="c1"># Direct Anthropic/OpenAI</span>
-</span><span id="__span-11-2"><a id="__codelineno-11-2" name="__codelineno-11-2" href="#__codelineno-11-2"></a>headroom<span class="w"> </span>proxy<span class="w"> </span>--backend<span class="w"> </span>bedrock<span class="w"> </span>--region<span class="w"> </span>us-east-1<span class="w">     </span><span class="c1"># AWS Bedrock</span>
-</span><span id="__span-11-3"><a id="__codelineno-11-3" name="__codelineno-11-3" href="#__codelineno-11-3"></a>headroom<span class="w"> </span>proxy<span class="w"> </span>--backend<span class="w"> </span>vertex_ai<span class="w"> </span>--region<span class="w"> </span>us-central1<span class="w"> </span><span class="c1"># Google Vertex AI</span>
-</span><span id="__span-11-4"><a id="__codelineno-11-4" name="__codelineno-11-4" href="#__codelineno-11-4"></a>headroom<span class="w"> </span>proxy<span class="w"> </span>--backend<span class="w"> </span>azure<span class="w">                          </span><span class="c1"># Azure OpenAI</span>
-</span><span id="__span-11-5"><a id="__codelineno-11-5" name="__codelineno-11-5" href="#__codelineno-11-5"></a>headroom<span class="w"> </span>proxy<span class="w"> </span>--backend<span class="w"> </span>openrouter<span class="w">                     </span><span class="c1"># OpenRouter (400+ models)</span>
+<div class="language-bash highlight"><pre><span></span><code><span id="__span-13-1"><a id="__codelineno-13-1" name="__codelineno-13-1" href="#__codelineno-13-1"></a>headroom<span class="w"> </span>proxy<span class="w">                                          </span><span class="c1"># Direct Anthropic/OpenAI</span>
+</span><span id="__span-13-2"><a id="__codelineno-13-2" name="__codelineno-13-2" href="#__codelineno-13-2"></a>headroom<span class="w"> </span>proxy<span class="w"> </span>--backend<span class="w"> </span>bedrock<span class="w"> </span>--region<span class="w"> </span>us-east-1<span class="w">     </span><span class="c1"># AWS Bedrock</span>
+</span><span id="__span-13-3"><a id="__codelineno-13-3" name="__codelineno-13-3" href="#__codelineno-13-3"></a>headroom<span class="w"> </span>proxy<span class="w"> </span>--backend<span class="w"> </span>vertex_ai<span class="w"> </span>--region<span class="w"> </span>us-central1<span class="w"> </span><span class="c1"># Google Vertex AI</span>
+</span><span id="__span-13-4"><a id="__codelineno-13-4" name="__codelineno-13-4" href="#__codelineno-13-4"></a>headroom<span class="w"> </span>proxy<span class="w"> </span>--backend<span class="w"> </span>azure<span class="w">                          </span><span class="c1"># Azure OpenAI</span>
+</span><span id="__span-13-5"><a id="__codelineno-13-5" name="__codelineno-13-5" href="#__codelineno-13-5"></a>headroom<span class="w"> </span>proxy<span class="w"> </span>--backend<span class="w"> </span>openrouter<span class="w">                     </span><span class="c1"># OpenRouter (400+ models)</span>
 </span></code></pre></div>
 <p>Or via LiteLLM for 100+ providers (Together, Groq, Fireworks, Ollama, vLLM, etc.).</p>
 <hr />
 <h2 id="installation">Installation<a class="headerlink" href="#installation" title="Permanent link">&para;</a></h2>
-<div class="language-bash highlight"><pre><span></span><code><span id="__span-12-1"><a id="__codelineno-12-1" name="__codelineno-12-1" href="#__codelineno-12-1"></a>pip<span class="w"> </span>install<span class="w"> </span>headroom-ai<span class="w">                </span><span class="c1"># Core library</span>
-</span><span id="__span-12-2"><a id="__codelineno-12-2" name="__codelineno-12-2" href="#__codelineno-12-2"></a>pip<span class="w"> </span>install<span class="w"> </span><span class="s2">&quot;headroom-ai[all]&quot;</span><span class="w">         </span><span class="c1"># Everything (recommended)</span>
-</span><span id="__span-12-3"><a id="__codelineno-12-3" name="__codelineno-12-3" href="#__codelineno-12-3"></a>pip<span class="w"> </span>install<span class="w"> </span><span class="s2">&quot;headroom-ai[proxy]&quot;</span><span class="w">       </span><span class="c1"># Proxy server + MCP tools</span>
-</span><span id="__span-12-4"><a id="__codelineno-12-4" name="__codelineno-12-4" href="#__codelineno-12-4"></a>pip<span class="w"> </span>install<span class="w"> </span><span class="s2">&quot;headroom-ai[ml]&quot;</span><span class="w">          </span><span class="c1"># ML compression (Kompress, requires torch)</span>
-</span><span id="__span-12-5"><a id="__codelineno-12-5" name="__codelineno-12-5" href="#__codelineno-12-5"></a>pip<span class="w"> </span>install<span class="w"> </span><span class="s2">&quot;headroom-ai[langchain]&quot;</span><span class="w">   </span><span class="c1"># LangChain integration</span>
-</span><span id="__span-12-6"><a id="__codelineno-12-6" name="__codelineno-12-6" href="#__codelineno-12-6"></a>pip<span class="w"> </span>install<span class="w"> </span><span class="s2">&quot;headroom-ai[agno]&quot;</span><span class="w">        </span><span class="c1"># Agno integration</span>
-</span><span id="__span-12-7"><a id="__codelineno-12-7" name="__codelineno-12-7" href="#__codelineno-12-7"></a>pip<span class="w"> </span>install<span class="w"> </span><span class="s2">&quot;headroom-ai[evals]&quot;</span><span class="w">       </span><span class="c1"># Evaluation framework</span>
+<div class="language-bash highlight"><pre><span></span><code><span id="__span-14-1"><a id="__codelineno-14-1" name="__codelineno-14-1" href="#__codelineno-14-1"></a>pip<span class="w"> </span>install<span class="w"> </span>headroom-ai<span class="w">                </span><span class="c1"># Core library (Python)</span>
+</span><span id="__span-14-2"><a id="__codelineno-14-2" name="__codelineno-14-2" href="#__codelineno-14-2"></a>pip<span class="w"> </span>install<span class="w"> </span><span class="s2">&quot;headroom-ai[all]&quot;</span><span class="w">         </span><span class="c1"># Everything (recommended)</span>
+</span><span id="__span-14-3"><a id="__codelineno-14-3" name="__codelineno-14-3" href="#__codelineno-14-3"></a>npm<span class="w"> </span>install<span class="w"> </span>headroom-ai<span class="w">                </span><span class="c1"># TypeScript / Node.js</span>
+</span><span id="__span-14-4"><a id="__codelineno-14-4" name="__codelineno-14-4" href="#__codelineno-14-4"></a>pip<span class="w"> </span>install<span class="w"> </span><span class="s2">&quot;headroom-ai[proxy]&quot;</span><span class="w">       </span><span class="c1"># Proxy server + MCP tools</span>
+</span><span id="__span-14-5"><a id="__codelineno-14-5" name="__codelineno-14-5" href="#__codelineno-14-5"></a>pip<span class="w"> </span>install<span class="w"> </span><span class="s2">&quot;headroom-ai[ml]&quot;</span><span class="w">          </span><span class="c1"># ML compression (Kompress, requires torch)</span>
+</span><span id="__span-14-6"><a id="__codelineno-14-6" name="__codelineno-14-6" href="#__codelineno-14-6"></a>pip<span class="w"> </span>install<span class="w"> </span><span class="s2">&quot;headroom-ai[langchain]&quot;</span><span class="w">   </span><span class="c1"># LangChain integration</span>
+</span><span id="__span-14-7"><a id="__codelineno-14-7" name="__codelineno-14-7" href="#__codelineno-14-7"></a>pip<span class="w"> </span>install<span class="w"> </span><span class="s2">&quot;headroom-ai[agno]&quot;</span><span class="w">        </span><span class="c1"># Agno integration</span>
+</span><span id="__span-14-8"><a id="__codelineno-14-8" name="__codelineno-14-8" href="#__codelineno-14-8"></a>pip<span class="w"> </span>install<span class="w"> </span><span class="s2">&quot;headroom-ai[evals]&quot;</span><span class="w">       </span><span class="c1"># Evaluation framework</span>
 </span></code></pre></div>
 <p>Requires Python 3.10+.</p>
 <hr />
