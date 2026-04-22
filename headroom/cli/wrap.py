@@ -26,7 +26,7 @@ import time
 import urllib.error
 import urllib.request
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 # Fix Windows cp1252 encoding — box-drawing characters require UTF-8
 if sys.platform == "win32" and hasattr(sys.stdout, "buffer"):
@@ -36,7 +36,22 @@ if sys.platform == "win32" and hasattr(sys.stdout, "buffer"):
 
 import click
 
+from headroom.copilot_auth import DEFAULT_API_URL as COPILOT_API_URL
+from headroom.copilot_auth import has_oauth_auth, resolve_client_bearer_token
+
 from .main import main
+
+
+def _live_wrap_module() -> Any:
+    """Return the current live wrap module instance.
+
+    CLI tests sometimes reload `headroom.cli.wrap` while still invoking Click
+    command callbacks that were registered from an older module instance. By
+    resolving helper calls through `sys.modules[__name__]`, patched helpers on
+    the live module continue to affect those callbacks.
+    """
+
+    return cast(Any, sys.modules[__name__])
 
 
 def _print_telemetry_notice() -> None:
@@ -85,6 +100,7 @@ def _start_proxy(
     backend: str | None = None,
     anyllm_provider: str | None = None,
     region: str | None = None,
+    openai_api_url: str | None = None,
 ) -> subprocess.Popen:
     """Start Headroom proxy as a background subprocess.
 
@@ -123,6 +139,9 @@ def _start_proxy(
     _region = region or os.environ.get("HEADROOM_REGION")
     if _region:
         cmd.extend(["--region", _region])
+
+    if openai_api_url:
+        cmd.extend(["--openai-api-url", openai_api_url])
 
     log_path = _get_log_path()
     log_file = open(log_path, "a")  # noqa: SIM115
@@ -644,7 +663,8 @@ def _recover_persistent_proxy(port: int) -> bool:
     from headroom.install.runtime import start_detached_agent, start_persistent_docker, wait_ready
     from headroom.install.supervisors import start_supervisor
 
-    manifest = _find_persistent_manifest(port)
+    helpers = _live_wrap_module()
+    manifest = helpers._find_persistent_manifest(port)
     if manifest is None:
         return False
 
@@ -694,6 +714,26 @@ def _copilot_model_configured(copilot_args: tuple[str, ...], env: dict[str, str]
     return False
 
 
+def _should_use_copilot_oauth(
+    *,
+    backend: str | None,
+    provider_type: str,
+    env: dict[str, str],
+) -> bool:
+    """Prefer existing Copilot auth when the requested routing supports it."""
+
+    if env.get("COPILOT_PROVIDER_API_KEY") or env.get("COPILOT_PROVIDER_BEARER_TOKEN"):
+        return False
+    if provider_type == "anthropic":
+        return False
+
+    effective_backend = backend or os.environ.get("HEADROOM_BACKEND")
+    if effective_backend not in (None, "", "anthropic"):
+        return False
+
+    return has_oauth_auth()
+
+
 def _ensure_proxy(
     port: int,
     no_proxy: bool,
@@ -705,26 +745,33 @@ def _ensure_proxy(
     backend: str | None = None,
     anyllm_provider: str | None = None,
     region: str | None = None,
+    openai_api_url: str | None = None,
 ) -> subprocess.Popen | None:
     """Start or verify proxy. Returns process handle if we started it."""
+    helpers = _live_wrap_module()
     if not no_proxy:
-        manifest = _find_persistent_manifest(port)
+        manifest = helpers._find_persistent_manifest(port)
         if manifest is not None:
             from headroom.install.health import probe_ready
 
             if probe_ready(manifest.health_url):
                 click.echo(f"  Proxy already running on port {port}")
                 return None
-            if _recover_persistent_proxy(port):
+            if helpers._recover_persistent_proxy(port):
                 return None
-            raise click.ClickException(
-                f"Persistent deployment '{manifest.profile}' on port {port} is not healthy."
+            if helpers._check_proxy(port):
+                raise click.ClickException(
+                    f"Persistent deployment '{manifest.profile}' on port {port} is not healthy."
+                )
+            click.echo(
+                f"  Warning: persistent deployment '{manifest.profile}' on port {port} "
+                "is stale; starting a fresh proxy instead."
             )
 
-        if _check_proxy(port):
+        if helpers._check_proxy(port):
             # Proxy is running — check if it has the features we need
             needs_restart = False
-            running_config = _query_proxy_config(port)
+            running_config = helpers._query_proxy_config(port)
 
             if running_config is not None:
                 missing = []
@@ -748,7 +795,7 @@ def _ensure_proxy(
 
                     proxy_pid = running_config.get("pid")
                     if proxy_pid is not None:
-                        if not _kill_proxy_by_pid(int(proxy_pid), port):
+                        if not helpers._kill_proxy_by_pid(int(proxy_pid), port):
                             raise click.ClickException(
                                 f"Failed to stop existing proxy (PID {proxy_pid}) on port {port}. "
                                 "Stop it manually and retry."
@@ -771,15 +818,19 @@ def _ensure_proxy(
         # Start (or restart) the proxy with the requested flags
         click.echo(f"  Starting Headroom proxy on port {port}...")
         try:
-            proc = _start_proxy(
-                port,
-                learn=learn,
-                memory=memory,
-                agent_type=agent_type,
-                code_graph=code_graph,
-                backend=backend,
-                anyllm_provider=anyllm_provider,
-                region=region,
+            proc = cast(
+                subprocess.Popen[Any],
+                helpers._start_proxy(
+                    port,
+                    learn=learn,
+                    memory=memory,
+                    agent_type=agent_type,
+                    code_graph=code_graph,
+                    backend=backend,
+                    anyllm_provider=anyllm_provider,
+                    region=region,
+                    openai_api_url=openai_api_url,
+                ),
             )
             click.echo(f"  Proxy ready on http://127.0.0.1:{port}")
             return proc
@@ -787,7 +838,7 @@ def _ensure_proxy(
             click.echo(f"  Error: {e}")
             raise SystemExit(1) from e
     else:
-        if not _check_proxy(port):
+        if not helpers._check_proxy(port):
             click.echo(f"  Warning: No proxy detected on port {port}")
         return None
 
@@ -847,6 +898,7 @@ def _launch_tool(
     backend: str | None = None,
     anyllm_provider: str | None = None,
     region: str | None = None,
+    openai_api_url: str | None = None,
 ) -> None:
     """Common logic: start proxy, launch tool, clean up."""
     proxy_holder: list[subprocess.Popen | None] = [None]
@@ -872,6 +924,7 @@ def _launch_tool(
             backend=backend,
             anyllm_provider=anyllm_provider,
             region=region,
+            openai_api_url=openai_api_url,
         )
 
         if code_graph:
@@ -1203,9 +1256,11 @@ def claude(
         headroom wrap claude --code-graph        # With code graph intelligence
         headroom wrap claude --no-rtk           # Skip rtk (proxy only)
     """
+    helpers = _live_wrap_module()
+
     if prepare_only:
         if not no_rtk:
-            _prepare_wrap_rtk(verbose=verbose, label="Claude")
+            helpers._prepare_wrap_rtk(verbose=verbose, label="Claude")
         return
 
     claude_bin = shutil.which("claude")
@@ -1216,7 +1271,7 @@ def claude(
 
     # Setup rtk before launching (Claude-specific)
     proxy_holder: list[subprocess.Popen | None] = [None]
-    cleanup = _make_cleanup(proxy_holder, port)
+    cleanup = helpers._make_cleanup(proxy_holder, port)
     signal.signal(signal.SIGINT, cleanup)
     signal.signal(signal.SIGTERM, cleanup)
 
@@ -1269,25 +1324,30 @@ def claude(
         click.echo("  ╚═══════════════════════════════════════════════╝")
         click.echo()
 
-        proxy_holder[0] = _ensure_proxy(
-            port, no_proxy, learn=learn, memory=memory, agent_type="claude", code_graph=code_graph
+        proxy_holder[0] = helpers._ensure_proxy(
+            port,
+            no_proxy,
+            learn=learn,
+            memory=memory,
+            agent_type="claude",
+            code_graph=code_graph,
         )
 
         if not no_rtk:
             click.echo("  Setting up rtk...")
-            _setup_rtk(verbose=verbose)
+            helpers._setup_rtk(verbose=verbose)
         elif verbose:
             click.echo("  Skipping rtk (--no-rtk)")
 
         if code_graph:
-            _setup_code_graph(verbose=verbose)
+            helpers._setup_code_graph(verbose=verbose)
 
         click.echo()
         click.echo("  Launching Claude Code (API routed through Headroom)...")
         click.echo(f"  ANTHROPIC_BASE_URL=http://127.0.0.1:{port}")
         if claude_args:
             click.echo(f"  Extra args: {' '.join(claude_args)}")
-        _print_telemetry_notice()
+        helpers._print_telemetry_notice()
         click.echo()
 
         env = os.environ.copy()
@@ -1412,58 +1472,81 @@ def copilot(
             _inject_rtk_instructions(copilot_instructions, verbose=verbose)
 
     env = os.environ.copy()
-    env["COPILOT_PROVIDER_TYPE"] = effective_provider_type
     env.pop("COPILOT_PROVIDER_WIRE_API", None)
+    openai_api_url: str | None = None
 
-    # Copilot BYOK requires COPILOT_PROVIDER_API_KEY — propagate from the
-    # user's existing provider key so they don't have to set it twice.
-    # Note: `headroom wrap copilot` uses Copilot's BYOK mode, which bypasses
-    # GitHub's Copilot API and talks directly to the model provider through
-    # the Headroom proxy. This requires the provider's own API key — a GitHub
-    # Copilot subscription alone is not sufficient for BYOK mode.
-    if not env.get("COPILOT_PROVIDER_API_KEY"):
-        if effective_provider_type == "anthropic":
-            _key = env.get("ANTHROPIC_API_KEY", "")
-        else:
-            _key = env.get("OPENAI_API_KEY", "")
-        if _key:
-            env["COPILOT_PROVIDER_API_KEY"] = _key
+    if _should_use_copilot_oauth(
+        backend=effective_backend,
+        provider_type=provider_type,
+        env=env,
+    ):
+        client_bearer = resolve_client_bearer_token()
+        if not client_bearer:
+            raise click.ClickException(
+                "GitHub Copilot auth was detected but no reusable bearer token could be resolved."
+            )
 
-    env_vars_display: list[str]
-    if effective_provider_type == "anthropic":
-        env["COPILOT_PROVIDER_BASE_URL"] = f"http://127.0.0.1:{port}"
-        env_vars_display = [
-            "COPILOT_PROVIDER_TYPE=anthropic",
-            f"COPILOT_PROVIDER_BASE_URL=http://127.0.0.1:{port}",
-        ]
-    else:
-        effective_wire_api = wire_api or "completions"
+        env["COPILOT_PROVIDER_TYPE"] = "openai"
         env["COPILOT_PROVIDER_BASE_URL"] = f"http://127.0.0.1:{port}/v1"
-        env["COPILOT_PROVIDER_WIRE_API"] = effective_wire_api
+        env["COPILOT_PROVIDER_WIRE_API"] = wire_api or "completions"
+        env["COPILOT_PROVIDER_BEARER_TOKEN"] = client_bearer
+        env.pop("COPILOT_PROVIDER_API_KEY", None)
         env_vars_display = [
             "COPILOT_PROVIDER_TYPE=openai",
             f"COPILOT_PROVIDER_BASE_URL=http://127.0.0.1:{port}/v1",
-            f"COPILOT_PROVIDER_WIRE_API={effective_wire_api}",
+            f"COPILOT_PROVIDER_WIRE_API={env['COPILOT_PROVIDER_WIRE_API']}",
+            "COPILOT_AUTH_MODE=github-oauth",
         ]
+        openai_api_url = COPILOT_API_URL
+    else:
+        env["COPILOT_PROVIDER_TYPE"] = effective_provider_type
 
-    if not env.get("COPILOT_PROVIDER_API_KEY"):
-        src = "ANTHROPIC_API_KEY" if effective_provider_type == "anthropic" else "OPENAI_API_KEY"
-        click.echo(
-            f"\n  Error: Copilot BYOK mode requires a provider API key.\n"
-            f"  `headroom wrap copilot` uses Copilot's BYOK mode, which bypasses GitHub's\n"
-            f"  Copilot API and routes requests directly to the model provider through the\n"
-            f"  Headroom proxy. A GitHub Copilot subscription alone is not sufficient.\n\n"
-            f"  Set one of:\n"
-            f"    export {src}=sk-...          # recommended\n"
-            f"    export COPILOT_PROVIDER_API_KEY=sk-...  # also works\n"
-        )
-        raise SystemExit(1)
+        # Copilot BYOK requires COPILOT_PROVIDER_API_KEY — propagate from the
+        # user's existing provider key so they don't have to set it twice.
+        if not env.get("COPILOT_PROVIDER_API_KEY"):
+            if effective_provider_type == "anthropic":
+                _key = env.get("ANTHROPIC_API_KEY", "")
+            else:
+                _key = env.get("OPENAI_API_KEY", "")
+            if _key:
+                env["COPILOT_PROVIDER_API_KEY"] = _key
 
-    if not _copilot_model_configured(copilot_args, env):
-        click.echo(
-            "  Note: Copilot BYOK requires a model. Pass `--model <name>` "
-            "or set `COPILOT_MODEL` / `COPILOT_PROVIDER_MODEL_ID`."
-        )
+        if effective_provider_type == "anthropic":
+            env["COPILOT_PROVIDER_BASE_URL"] = f"http://127.0.0.1:{port}"
+            env_vars_display = [
+                "COPILOT_PROVIDER_TYPE=anthropic",
+                f"COPILOT_PROVIDER_BASE_URL=http://127.0.0.1:{port}",
+            ]
+        else:
+            effective_wire_api = wire_api or "completions"
+            env["COPILOT_PROVIDER_BASE_URL"] = f"http://127.0.0.1:{port}/v1"
+            env["COPILOT_PROVIDER_WIRE_API"] = effective_wire_api
+            env_vars_display = [
+                "COPILOT_PROVIDER_TYPE=openai",
+                f"COPILOT_PROVIDER_BASE_URL=http://127.0.0.1:{port}/v1",
+                f"COPILOT_PROVIDER_WIRE_API={effective_wire_api}",
+            ]
+
+        if not env.get("COPILOT_PROVIDER_API_KEY"):
+            src = (
+                "ANTHROPIC_API_KEY" if effective_provider_type == "anthropic" else "OPENAI_API_KEY"
+            )
+            click.echo(
+                f"\n  Error: Copilot BYOK mode requires a provider API key.\n"
+                f"  No reusable GitHub Copilot OAuth session was found, so Headroom fell back to\n"
+                f"  Copilot's BYOK provider mode. That mode bypasses GitHub's Copilot API and\n"
+                f"  routes requests directly to the model provider through the Headroom proxy.\n\n"
+                f"  Set one of:\n"
+                f"    export {src}=sk-...          # recommended\n"
+                f"    export COPILOT_PROVIDER_API_KEY=sk-...  # also works\n"
+            )
+            raise SystemExit(1)
+
+        if not _copilot_model_configured(copilot_args, env):
+            click.echo(
+                "  Note: Copilot BYOK requires a model. Pass `--model <name>` "
+                "or set `COPILOT_MODEL` / `COPILOT_PROVIDER_MODEL_ID`."
+            )
 
     _launch_tool(
         binary=copilot_bin,
@@ -1479,6 +1562,7 @@ def copilot(
         backend=backend,
         anyllm_provider=anyllm_provider,
         region=region,
+        openai_api_url=openai_api_url,
     )
 
 
