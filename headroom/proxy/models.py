@@ -10,6 +10,8 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Literal
 
+from headroom.providers.registry import ProviderApiOverrides
+
 # =============================================================================
 # Data Models
 # =============================================================================
@@ -47,6 +49,11 @@ class RequestLog:
     request_messages: list[dict] | None = None
     response_content: str | None = None
     error: str | None = None
+
+    # Groups every agent-loop API call from one user prompt into a single turn.
+    # See ``headroom.proxy.helpers.compute_turn_id`` for the derivation. None
+    # when no user-text message is present in the request.
+    turn_id: str | None = None
 
     # NOTE (Unit 2 follow-up): stage timings and session_id were briefly
     # added here but are now emitted exclusively through
@@ -211,10 +218,12 @@ class ProxyConfig:
 
     # Compression Hooks
     hooks: Any = None
+    pipeline_extensions: list[Any] = field(default_factory=list)
+    discover_pipeline_extensions: bool = True
 
     # Subscription Window Tracking (Anthropic OAuth accounts)
     subscription_tracking_enabled: bool = True
-    subscription_poll_interval_s: int = 10
+    subscription_poll_interval_s: int = 300
     subscription_active_window_s: int = 60
 
     # Stateless mode — disable all filesystem writes for read-only / container deployments
@@ -246,3 +255,13 @@ class ProxyConfig:
     # is still holding a pre-upstream slot. Compression already has its own
     # COMPRESSION_TIMEOUT_SECONDS guard; this bounds the memory leg too.
     anthropic_pre_upstream_memory_context_timeout_seconds: float = 2.0
+
+    @property
+    def provider_api_overrides(self) -> ProviderApiOverrides:
+        """Return provider API URL overrides as a dedicated provider config object."""
+        return ProviderApiOverrides(
+            anthropic=self.anthropic_api_url,
+            openai=self.openai_api_url,
+            gemini=self.gemini_api_url,
+            cloudcode=self.cloudcode_api_url,
+        )
