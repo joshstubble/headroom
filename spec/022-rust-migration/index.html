@@ -10,7 +10,7 @@
       
       
       
-        <link rel="canonical" href="https://chopratejas.github.io/headroom/spec/017-operations/">
+        <link rel="canonical" href="https://chopratejas.github.io/headroom/spec/022-rust-migration/">
       
       
       
@@ -23,7 +23,7 @@
     
     
       
-        <title>017. Operations - Headroom</title>
+        <title>022. Rust Migration - Headroom</title>
       
     
     
@@ -76,7 +76,7 @@
     <div data-md-component="skip">
       
         
-        <a href="#017-operations" class="md-skip">
+        <a href="#022-rust-migration" class="md-skip">
           Skip to content
         </a>
       
@@ -112,7 +112,7 @@
         <div class="md-header__topic" data-md-component="header-topic">
           <span class="md-ellipsis">
             
-              017. Operations
+              022. Rust Migration
             
           </span>
         </div>
@@ -1867,22 +1867,55 @@
     <ul class="md-nav__list" data-md-component="toc" data-md-scrollfix>
       
         <li class="md-nav__item">
-  <a href="#health-endpoints" class="md-nav__link">
+  <a href="#why-rust" class="md-nav__link">
     <span class="md-ellipsis">
       
-        Health Endpoints
+        Why Rust
       
     </span>
   </a>
   
-    <nav class="md-nav" aria-label="Health Endpoints">
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#target-architecture" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Target architecture
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#migration-strategy" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Migration strategy
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#stages" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Stages
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Stages">
       <ul class="md-nav__list">
         
           <li class="md-nav__item">
-  <a href="#get-health" class="md-nav__link">
+  <a href="#stage-0-foundation" class="md-nav__link">
     <span class="md-ellipsis">
       
-        GET /health
+        Stage 0 — Foundation ✅
       
     </span>
   </a>
@@ -1890,10 +1923,10 @@
 </li>
         
           <li class="md-nav__item">
-  <a href="#get-livez" class="md-nav__link">
+  <a href="#stage-1-rust-proxy-as-passthrough" class="md-nav__link">
     <span class="md-ellipsis">
       
-        GET /livez
+        Stage 1 — Rust proxy as passthrough
       
     </span>
   </a>
@@ -1901,10 +1934,76 @@
 </li>
         
           <li class="md-nav__item">
-  <a href="#get-readyz" class="md-nav__link">
+  <a href="#stage-2-first-native-route" class="md-nav__link">
     <span class="md-ellipsis">
       
-        GET /readyz
+        Stage 2 — First native route
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#stage-3-shadow-mode-validation" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Stage 3 — Shadow mode validation
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#stage-4-provider-expansion" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Stage 4 — Provider expansion
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#stage-5-code-aware-transforms" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Stage 5 — Code-aware transforms
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#stage-6-storage-layer" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Stage 6 — Storage layer
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#stage-7-onnx-migration" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Stage 7 — ONNX migration
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#stage-8-retire-the-python-proxy" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Stage 8 — Retire the Python proxy
       
     </span>
   </a>
@@ -1917,183 +2016,10 @@
 </li>
       
         <li class="md-nav__item">
-  <a href="#logs" class="md-nav__link">
+  <a href="#what-does-not-change" class="md-nav__link">
     <span class="md-ellipsis">
       
-        Logs
-      
-    </span>
-  </a>
-  
-    <nav class="md-nav" aria-label="Logs">
-      <ul class="md-nav__list">
-        
-          <li class="md-nav__item">
-  <a href="#log-locations" class="md-nav__link">
-    <span class="md-ellipsis">
-      
-        Log Locations
-      
-    </span>
-  </a>
-  
-</li>
-        
-          <li class="md-nav__item">
-  <a href="#log-levels" class="md-nav__link">
-    <span class="md-ellipsis">
-      
-        Log Levels
-      
-    </span>
-  </a>
-  
-</li>
-        
-      </ul>
-    </nav>
-  
-</li>
-      
-        <li class="md-nav__item">
-  <a href="#metrics" class="md-nav__link">
-    <span class="md-ellipsis">
-      
-        Metrics
-      
-    </span>
-  </a>
-  
-    <nav class="md-nav" aria-label="Metrics">
-      <ul class="md-nav__list">
-        
-          <li class="md-nav__item">
-  <a href="#prometheus" class="md-nav__link">
-    <span class="md-ellipsis">
-      
-        Prometheus
-      
-    </span>
-  </a>
-  
-</li>
-        
-      </ul>
-    </nav>
-  
-</li>
-      
-        <li class="md-nav__item">
-  <a href="#upgrade-procedure" class="md-nav__link">
-    <span class="md-ellipsis">
-      
-        Upgrade Procedure
-      
-    </span>
-  </a>
-  
-    <nav class="md-nav" aria-label="Upgrade Procedure">
-      <ul class="md-nav__list">
-        
-          <li class="md-nav__item">
-  <a href="#docker" class="md-nav__link">
-    <span class="md-ellipsis">
-      
-        Docker
-      
-    </span>
-  </a>
-  
-</li>
-        
-          <li class="md-nav__item">
-  <a href="#native" class="md-nav__link">
-    <span class="md-ellipsis">
-      
-        Native
-      
-    </span>
-  </a>
-  
-</li>
-        
-          <li class="md-nav__item">
-  <a href="#embedded" class="md-nav__link">
-    <span class="md-ellipsis">
-      
-        Embedded
-      
-    </span>
-  </a>
-  
-</li>
-        
-      </ul>
-    </nav>
-  
-</li>
-      
-        <li class="md-nav__item">
-  <a href="#rollback" class="md-nav__link">
-    <span class="md-ellipsis">
-      
-        Rollback
-      
-    </span>
-  </a>
-  
-    <nav class="md-nav" aria-label="Rollback">
-      <ul class="md-nav__list">
-        
-          <li class="md-nav__item">
-  <a href="#docker_1" class="md-nav__link">
-    <span class="md-ellipsis">
-      
-        Docker
-      
-    </span>
-  </a>
-  
-</li>
-        
-      </ul>
-    </nav>
-  
-</li>
-      
-        <li class="md-nav__item">
-  <a href="#monitoring" class="md-nav__link">
-    <span class="md-ellipsis">
-      
-        Monitoring
-      
-    </span>
-  </a>
-  
-    <nav class="md-nav" aria-label="Monitoring">
-      <ul class="md-nav__list">
-        
-          <li class="md-nav__item">
-  <a href="#key-metrics-to-watch" class="md-nav__link">
-    <span class="md-ellipsis">
-      
-        Key Metrics to Watch
-      
-    </span>
-  </a>
-  
-</li>
-        
-      </ul>
-    </nav>
-  
-</li>
-      
-        <li class="md-nav__item">
-  <a href="#runbook" class="md-nav__link">
-    <span class="md-ellipsis">
-      
-        Runbook
+        What does not change
       
     </span>
   </a>
@@ -2101,10 +2027,32 @@
 </li>
       
         <li class="md-nav__item">
-  <a href="#version-history" class="md-nav__link">
+  <a href="#contributing" class="md-nav__link">
     <span class="md-ellipsis">
       
-        Version History
+        Contributing
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#risks-and-open-questions" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Risks and open questions
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#references" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        References
       
     </span>
   </a>
@@ -2131,180 +2079,74 @@
   
 
 
-<h1 id="017-operations">017. Operations<a class="headerlink" href="#017-operations" title="Permanent link">&para;</a></h1>
-<p><strong>Status:</strong> done</p>
-<h2 id="health-endpoints">Health Endpoints<a class="headerlink" href="#health-endpoints" title="Permanent link">&para;</a></h2>
-<h3 id="get-health"><code>GET /health</code><a class="headerlink" href="#get-health" title="Permanent link">&para;</a></h3>
-<p>Basic health check. Returns 200 if process is running.</p>
-<div class="language-bash highlight"><pre><span></span><code><span id="__span-0-1"><a id="__codelineno-0-1" name="__codelineno-0-1" href="#__codelineno-0-1"></a>curl<span class="w"> </span>http://localhost:8787/health
-</span></code></pre></div>
-<p><strong>Response:</strong>
-<div class="language-json highlight"><pre><span></span><code><span id="__span-1-1"><a id="__codelineno-1-1" name="__codelineno-1-1" href="#__codelineno-1-1"></a><span class="p">{</span>
-</span><span id="__span-1-2"><a id="__codelineno-1-2" name="__codelineno-1-2" href="#__codelineno-1-2"></a><span class="w">  </span><span class="nt">&quot;status&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;healthy&quot;</span><span class="p">,</span>
-</span><span id="__span-1-3"><a id="__codelineno-1-3" name="__codelineno-1-3" href="#__codelineno-1-3"></a><span class="w">  </span><span class="nt">&quot;version&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;1.0.0&quot;</span>
-</span><span id="__span-1-4"><a id="__codelineno-1-4" name="__codelineno-1-4" href="#__codelineno-1-4"></a><span class="p">}</span>
-</span></code></pre></div></p>
-<hr />
-<h3 id="get-livez"><code>GET /livez</code><a class="headerlink" href="#get-livez" title="Permanent link">&para;</a></h3>
-<p>Liveness check. Returns 200 if process is alive.</p>
-<div class="language-bash highlight"><pre><span></span><code><span id="__span-2-1"><a id="__codelineno-2-1" name="__codelineno-2-1" href="#__codelineno-2-1"></a>curl<span class="w"> </span>http://localhost:8787/livez
-</span></code></pre></div>
-<hr />
-<h3 id="get-readyz"><code>GET /readyz</code><a class="headerlink" href="#get-readyz" title="Permanent link">&para;</a></h3>
-<p>Readiness check. Returns 200 if ready to serve traffic.</p>
-<div class="language-bash highlight"><pre><span></span><code><span id="__span-3-1"><a id="__codelineno-3-1" name="__codelineno-3-1" href="#__codelineno-3-1"></a>curl<span class="w"> </span>http://localhost:8787/readyz
-</span></code></pre></div>
-<p><strong>Response:</strong>
-<div class="language-json highlight"><pre><span></span><code><span id="__span-4-1"><a id="__codelineno-4-1" name="__codelineno-4-1" href="#__codelineno-4-1"></a><span class="p">{</span>
-</span><span id="__span-4-2"><a id="__codelineno-4-2" name="__codelineno-4-2" href="#__codelineno-4-2"></a><span class="w">  </span><span class="nt">&quot;ready&quot;</span><span class="p">:</span><span class="w"> </span><span class="kc">true</span><span class="p">,</span>
-</span><span id="__span-4-3"><a id="__codelineno-4-3" name="__codelineno-4-3" href="#__codelineno-4-3"></a><span class="w">  </span><span class="nt">&quot;checks&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
-</span><span id="__span-4-4"><a id="__codelineno-4-4" name="__codelineno-4-4" href="#__codelineno-4-4"></a><span class="w">    </span><span class="nt">&quot;database&quot;</span><span class="p">:</span><span class="w"> </span><span class="kc">true</span><span class="p">,</span>
-</span><span id="__span-4-5"><a id="__codelineno-4-5" name="__codelineno-4-5" href="#__codelineno-4-5"></a><span class="w">    </span><span class="nt">&quot;cache&quot;</span><span class="p">:</span><span class="w"> </span><span class="kc">true</span><span class="p">,</span>
-</span><span id="__span-4-6"><a id="__codelineno-4-6" name="__codelineno-4-6" href="#__codelineno-4-6"></a><span class="w">    </span><span class="nt">&quot;provider&quot;</span><span class="p">:</span><span class="w"> </span><span class="kc">true</span>
-</span><span id="__span-4-7"><a id="__codelineno-4-7" name="__codelineno-4-7" href="#__codelineno-4-7"></a><span class="w">  </span><span class="p">}</span>
-</span><span id="__span-4-8"><a id="__codelineno-4-8" name="__codelineno-4-8" href="#__codelineno-4-8"></a><span class="p">}</span>
-</span></code></pre></div></p>
-<hr />
-<h2 id="logs">Logs<a class="headerlink" href="#logs" title="Permanent link">&para;</a></h2>
-<h3 id="log-locations">Log Locations<a class="headerlink" href="#log-locations" title="Permanent link">&para;</a></h3>
-<table>
-<thead>
-<tr>
-<th>Installation</th>
-<th>Location</th>
-</tr>
-</thead>
-<tbody>
-<tr>
-<td>Docker</td>
-<td><code>docker logs headroom</code></td>
-</tr>
-<tr>
-<td>Native</td>
-<td><code>~/.headroom/logs/</code></td>
-</tr>
-<tr>
-<td>Systemd</td>
-<td><code>journalctl -u headroom</code></td>
-</tr>
-</tbody>
-</table>
-<h3 id="log-levels">Log Levels<a class="headerlink" href="#log-levels" title="Permanent link">&para;</a></h3>
-<p>Set via environment:
-<div class="language-bash highlight"><pre><span></span><code><span id="__span-5-1"><a id="__codelineno-5-1" name="__codelineno-5-1" href="#__codelineno-5-1"></a><span class="nv">HEADROOM_LOG_LEVEL</span><span class="o">=</span>INFO
-</span></code></pre></div></p>
-<p>Or in config:
-<div class="language-yaml highlight"><pre><span></span><code><span id="__span-6-1"><a id="__codelineno-6-1" name="__codelineno-6-1" href="#__codelineno-6-1"></a><span class="nt">logging</span><span class="p">:</span>
-</span><span id="__span-6-2"><a id="__codelineno-6-2" name="__codelineno-6-2" href="#__codelineno-6-2"></a><span class="w">  </span><span class="nt">level</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">INFO</span>
-</span><span id="__span-6-3"><a id="__codelineno-6-3" name="__codelineno-6-3" href="#__codelineno-6-3"></a><span class="w">  </span><span class="nt">format</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">json</span>
-</span></code></pre></div></p>
-<hr />
-<h2 id="metrics">Metrics<a class="headerlink" href="#metrics" title="Permanent link">&para;</a></h2>
-<h3 id="prometheus">Prometheus<a class="headerlink" href="#prometheus" title="Permanent link">&para;</a></h3>
-<p><strong>Scrape Config:</strong>
-<div class="language-yaml highlight"><pre><span></span><code><span id="__span-7-1"><a id="__codelineno-7-1" name="__codelineno-7-1" href="#__codelineno-7-1"></a><span class="nt">scrape_configs</span><span class="p">:</span>
-</span><span id="__span-7-2"><a id="__codelineno-7-2" name="__codelineno-7-2" href="#__codelineno-7-2"></a><span class="w">  </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">job_name</span><span class="p">:</span><span class="w"> </span><span class="s">&#39;headroom&#39;</span>
-</span><span id="__span-7-3"><a id="__codelineno-7-3" name="__codelineno-7-3" href="#__codelineno-7-3"></a><span class="w">    </span><span class="nt">static_configs</span><span class="p">:</span>
-</span><span id="__span-7-4"><a id="__codelineno-7-4" name="__codelineno-7-4" href="#__codelineno-7-4"></a><span class="w">      </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">targets</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">[</span><span class="s">&#39;localhost:8787&#39;</span><span class="p p-Indicator">]</span>
-</span><span id="__span-7-5"><a id="__codelineno-7-5" name="__codelineno-7-5" href="#__codelineno-7-5"></a><span class="w">    </span><span class="nt">metrics_path</span><span class="p">:</span><span class="w"> </span><span class="s">&#39;/metrics&#39;</span>
-</span></code></pre></div></p>
-<hr />
-<h2 id="upgrade-procedure">Upgrade Procedure<a class="headerlink" href="#upgrade-procedure" title="Permanent link">&para;</a></h2>
-<h3 id="docker">Docker<a class="headerlink" href="#docker" title="Permanent link">&para;</a></h3>
-<div class="language-bash highlight"><pre><span></span><code><span id="__span-8-1"><a id="__codelineno-8-1" name="__codelineno-8-1" href="#__codelineno-8-1"></a>docker<span class="w"> </span>pull<span class="w"> </span>headroom-ai/headroom:latest
-</span><span id="__span-8-2"><a id="__codelineno-8-2" name="__codelineno-8-2" href="#__codelineno-8-2"></a>docker-compose<span class="w"> </span>down
-</span><span id="__span-8-3"><a id="__codelineno-8-3" name="__codelineno-8-3" href="#__codelineno-8-3"></a>docker-compose<span class="w"> </span>up<span class="w"> </span>-d
-</span></code></pre></div>
-<h3 id="native">Native<a class="headerlink" href="#native" title="Permanent link">&para;</a></h3>
-<div class="language-bash highlight"><pre><span></span><code><span id="__span-9-1"><a id="__codelineno-9-1" name="__codelineno-9-1" href="#__codelineno-9-1"></a>pip<span class="w"> </span>install<span class="w"> </span>--upgrade<span class="w"> </span>headroom-ai
-</span><span id="__span-9-2"><a id="__codelineno-9-2" name="__codelineno-9-2" href="#__codelineno-9-2"></a><span class="c1"># Restart headroom service</span>
-</span></code></pre></div>
-<h3 id="embedded">Embedded<a class="headerlink" href="#embedded" title="Permanent link">&para;</a></h3>
-<div class="language-bash highlight"><pre><span></span><code><span id="__span-10-1"><a id="__codelineno-10-1" name="__codelineno-10-1" href="#__codelineno-10-1"></a>pip<span class="w"> </span>install<span class="w"> </span>--upgrade<span class="w"> </span>headroom-ai
-</span><span id="__span-10-2"><a id="__codelineno-10-2" name="__codelineno-10-2" href="#__codelineno-10-2"></a><span class="c1"># Restart application</span>
-</span></code></pre></div>
-<hr />
-<h2 id="rollback">Rollback<a class="headerlink" href="#rollback" title="Permanent link">&para;</a></h2>
-<h3 id="docker_1">Docker<a class="headerlink" href="#docker_1" title="Permanent link">&para;</a></h3>
-<div class="language-bash highlight"><pre><span></span><code><span id="__span-11-1"><a id="__codelineno-11-1" name="__codelineno-11-1" href="#__codelineno-11-1"></a>docker-compose<span class="w"> </span>down
-</span><span id="__span-11-2"><a id="__codelineno-11-2" name="__codelineno-11-2" href="#__codelineno-11-2"></a>docker<span class="w"> </span>tag<span class="w"> </span>headroom-ai/headroom:latest<span class="w"> </span>headroom-ai/headroom:rollback
-</span><span id="__span-11-3"><a id="__codelineno-11-3" name="__codelineno-11-3" href="#__codelineno-11-3"></a><span class="c1"># Edit docker-compose.yml to use rollback tag</span>
-</span><span id="__span-11-4"><a id="__codelineno-11-4" name="__codelineno-11-4" href="#__codelineno-11-4"></a>docker-compose<span class="w"> </span>up<span class="w"> </span>-d
-</span></code></pre></div>
-<hr />
-<h2 id="monitoring">Monitoring<a class="headerlink" href="#monitoring" title="Permanent link">&para;</a></h2>
-<h3 id="key-metrics-to-watch">Key Metrics to Watch<a class="headerlink" href="#key-metrics-to-watch" title="Permanent link">&para;</a></h3>
+<h1 id="022-rust-migration">022. Rust Migration<a class="headerlink" href="#022-rust-migration" title="Permanent link">&para;</a></h1>
+<p><strong>Status:</strong> in-progress (Stage 0 complete)</p>
+<p>Headroom is evolving from a pure-Python proxy into a Rust engine with a Python SDK layer. This document describes the motivation, target architecture, and phased execution plan. It is the source of truth for the migration; the Discord announcement and contributor docs are derived from it.</p>
+<h2 id="why-rust">Why Rust<a class="headerlink" href="#why-rust" title="Permanent link">&para;</a></h2>
+<p>Three forces push us toward Rust:</p>
 <ol>
-<li><strong>Request rate</strong> — requests per second</li>
-<li><strong>Error rate</strong> — 4xx + 5xx / total</li>
-<li><strong>Savings rate</strong> — average savings percentage</li>
-<li><strong>Latency</strong> — p50, p95, p99</li>
-<li><strong>Cache hit rate</strong> — hits / total</li>
+<li><strong>Latency.</strong> Every LLM request flows through compression transforms on the hot path. Rust runs that math 2–10× faster than Python, with negligible interpreter overhead and near-instant cold starts.</li>
+<li><strong>Deployment.</strong> A Rust proxy is a single static binary (~10 MB). No Python interpreter, no pip, no wheel matrix, no model downloads at startup. It drops cleanly into containers, serverless runtimes, or bare hosts.</li>
+<li><strong>Non-Python consumers.</strong> Integrations like the TypeScript OpenClaw plugin talk to Headroom over HTTP. A faster proxy makes every downstream client faster without changing any client code.</li>
 </ol>
-<p><strong>Prometheus queries:</strong>
-<div class="language-promql highlight"><pre><span></span><code><span id="__span-12-1"><a id="__codelineno-12-1" name="__codelineno-12-1" href="#__codelineno-12-1"></a><span class="c1"># Request rate</span>
-</span><span id="__span-12-2"><a id="__codelineno-12-2" name="__codelineno-12-2" href="#__codelineno-12-2"></a><span class="kr">rate</span><span class="o">(</span><span class="nv">headroom_requests_total</span><span class="p">[</span><span class="s">5m</span><span class="p">]</span><span class="o">)</span>
-</span><span id="__span-12-3"><a id="__codelineno-12-3" name="__codelineno-12-3" href="#__codelineno-12-3"></a>
-</span><span id="__span-12-4"><a id="__codelineno-12-4" name="__codelineno-12-4" href="#__codelineno-12-4"></a><span class="c1"># Error rate</span>
-</span><span id="__span-12-5"><a id="__codelineno-12-5" name="__codelineno-12-5" href="#__codelineno-12-5"></a><span class="kr">rate</span><span class="o">(</span><span class="nv">headroom_errors_total</span><span class="p">[</span><span class="s">5m</span><span class="p">]</span><span class="o">)</span><span class="w"> </span><span class="o">/</span><span class="w"> </span><span class="kr">rate</span><span class="o">(</span><span class="nv">headroom_requests_total</span><span class="p">[</span><span class="s">5m</span><span class="p">]</span><span class="o">)</span>
-</span><span id="__span-12-6"><a id="__codelineno-12-6" name="__codelineno-12-6" href="#__codelineno-12-6"></a>
-</span><span id="__span-12-7"><a id="__codelineno-12-7" name="__codelineno-12-7" href="#__codelineno-12-7"></a><span class="c1"># Average savings</span>
-</span><span id="__span-12-8"><a id="__codelineno-12-8" name="__codelineno-12-8" href="#__codelineno-12-8"></a><span class="kr">rate</span><span class="o">(</span><span class="nv">headroom_tokens_original</span><span class="p">[</span><span class="s">5m</span><span class="p">]</span><span class="w"> </span><span class="o">-</span><span class="w"> </span><span class="nv">headroom_tokens_compressed</span><span class="p">[</span><span class="s">5m</span><span class="p">]</span><span class="o">)</span><span class="w"> </span><span class="o">/</span><span class="w"> </span><span class="kr">rate</span><span class="o">(</span><span class="nv">headroom_tokens_original</span><span class="p">[</span><span class="s">5m</span><span class="p">]</span><span class="o">)</span>
-</span><span id="__span-12-9"><a id="__codelineno-12-9" name="__codelineno-12-9" href="#__codelineno-12-9"></a>
-</span><span id="__span-12-10"><a id="__codelineno-12-10" name="__codelineno-12-10" href="#__codelineno-12-10"></a><span class="c1"># Cache hit rate</span>
-</span><span id="__span-12-11"><a id="__codelineno-12-11" name="__codelineno-12-11" href="#__codelineno-12-11"></a><span class="kr">rate</span><span class="o">(</span><span class="nv">headroom_cache_hits_total</span><span class="p">[</span><span class="s">5m</span><span class="p">]</span><span class="o">)</span><span class="w"> </span><span class="o">/</span><span class="w"> </span><span class="o">(</span><span class="kr">rate</span><span class="o">(</span><span class="nv">headroom_cache_hits_total</span><span class="p">[</span><span class="s">5m</span><span class="p">]</span><span class="o">)</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="kr">rate</span><span class="o">(</span><span class="nv">headroom_cache_misses_total</span><span class="p">[</span><span class="s">5m</span><span class="p">]</span><span class="o">))</span>
-</span></code></pre></div></p>
-<hr />
-<h2 id="runbook">Runbook<a class="headerlink" href="#runbook" title="Permanent link">&para;</a></h2>
-<table>
-<thead>
-<tr>
-<th>Symptom</th>
-<th>Cause</th>
-<th>Solution</th>
-</tr>
-</thead>
-<tbody>
-<tr>
-<td>"Connection refused"</td>
-<td>Proxy not running</td>
-<td>Start it with <code>headroom proxy</code></td>
-</tr>
-<tr>
-<td>"Cache miss on every request"</td>
-<td>Cache disabled</td>
-<td>Start without <code>--no-cache</code></td>
-</tr>
-<tr>
-<td>"No savings shown"</td>
-<td>Database locked</td>
-<td>Check file permissions</td>
-</tr>
-<tr>
-<td>"Provider timeout"</td>
-<td>Network issue</td>
-<td>Check firewall/proxy</td>
-</tr>
-</tbody>
-</table>
-<hr />
-<h2 id="version-history">Version History<a class="headerlink" href="#version-history" title="Permanent link">&para;</a></h2>
-<table>
-<thead>
-<tr>
-<th>Version</th>
-<th>Date</th>
-<th>Changes</th>
-</tr>
-</thead>
-<tbody>
-<tr>
-<td>1.0.0-draft</td>
-<td>2026-04-16</td>
-<td>Initial operations document</td>
-</tr>
-</tbody>
-</table>
+<p>The Python code is not being thrown away. Rust lives alongside Python in the same repository, the HTTP contract stays stable, and existing users see no breaking changes.</p>
+<h2 id="target-architecture">Target architecture<a class="headerlink" href="#target-architecture" title="Permanent link">&para;</a></h2>
+<p>Two new artifacts, built over time:</p>
+<ul>
+<li><strong><code>headroom-proxy</code></strong> — a standalone Rust binary that speaks the existing Headroom HTTP API and contains native implementations of the proxy's hot-path logic (routing, streaming, compression, telemetry). This is the deployable artifact.</li>
+<li><strong><code>headroom-core</code></strong> — a Rust library with the compression transforms (CCR, log compressor, diff compressor, tokenizer, code compressor, content router, etc.). Consumed by <code>headroom-proxy</code> directly; optionally exposed to Python via a PyO3 binding if/when embedded SDK use warrants it.</li>
+</ul>
+<p>Both live in a Cargo workspace under <code>crates/</code> at the repo root. They are built, tested, and released together with the Python package.</p>
+<h2 id="migration-strategy">Migration strategy<a class="headerlink" href="#migration-strategy" title="Permanent link">&para;</a></h2>
+<p><strong>Trunk-based, no long-lived branch.</strong> Every Rust change ships as a small PR to <code>main</code>. Rust and Python live side by side. CI enforces parity on every PR — if the Rust port diverges from the Python reference, the build fails.</p>
+<p><strong>Proxy-first, not transforms-first.</strong> We build the Rust proxy binary as the primary deliverable, starting from a pure HTTP passthrough that forwards upstream to the existing Python proxy. Native Rust implementations of individual routes then replace passthroughs one at a time, gated by feature flags. This lets us ship a deployable Rust binary on day one and iterate without modifying Python internals.</p>
+<p><strong>Feature-flagged cutover.</strong> Each native Rust route is toggled by config. Default is passthrough-to-Python until a route has been shadow-tested and validated. Rollback is a flag flip, not a redeploy.</p>
+<p><strong>Parity by shadow traffic.</strong> Recorded input/output fixtures give us a unit-test-level parity check. Shadow mode — running both proxies on live traffic and diffing outputs — gives us the real validation gate before any cutover.</p>
+<h2 id="stages">Stages<a class="headerlink" href="#stages" title="Permanent link">&para;</a></h2>
+<h3 id="stage-0-foundation">Stage 0 — Foundation ✅<a class="headerlink" href="#stage-0-foundation" title="Permanent link">&para;</a></h3>
+<p>Cargo workspace with four crates (<code>headroom-core</code>, <code>headroom-proxy</code>, <code>headroom-py</code>, <code>headroom-parity</code>), CI, build tooling (Makefile, GitHub Actions), and a parity test harness seeded with 125 recorded fixtures across 5 leaf transforms. No production behavior changed.</p>
+<h3 id="stage-1-rust-proxy-as-passthrough">Stage 1 — Rust proxy as passthrough<a class="headerlink" href="#stage-1-rust-proxy-as-passthrough" title="Permanent link">&para;</a></h3>
+<p><code>headroom-proxy</code> accepts requests on the same HTTP contract as the Python proxy and forwards everything upstream to Python. No transforms yet, no intelligence. The point is a deployable binary that can run in front of the existing stack with zero risk.</p>
+<h3 id="stage-2-first-native-route">Stage 2 — First native route<a class="headerlink" href="#stage-2-first-native-route" title="Permanent link">&para;</a></h3>
+<p>Replace the passthrough for <code>/v1/chat/completions</code> (OpenAI) with a native Rust implementation: Rust transforms, direct provider call, streamed response. Feature-flagged. Python proxy handles everything else unchanged.</p>
+<h3 id="stage-3-shadow-mode-validation">Stage 3 — Shadow mode validation<a class="headerlink" href="#stage-3-shadow-mode-validation" title="Permanent link">&para;</a></h3>
+<p>Run both proxies on real traffic. Diff outputs with tolerance for chunk timing (SSE). Gate: one week of ≤ 0.1% content divergence before flipping the flag for real.</p>
+<h3 id="stage-4-provider-expansion">Stage 4 — Provider expansion<a class="headerlink" href="#stage-4-provider-expansion" title="Permanent link">&para;</a></h3>
+<p>Anthropic, Google, Cohere, Mistral, Bedrock, others. Each provider goes through its own shadow period before cutover.</p>
+<h3 id="stage-5-code-aware-transforms">Stage 5 — Code-aware transforms<a class="headerlink" href="#stage-5-code-aware-transforms" title="Permanent link">&para;</a></h3>
+<p>Port <code>code_compressor</code> (tree-sitter, already Rust-native upstream), <code>content_router</code>, <code>content_detector</code>. These are larger transforms but have no ML dependencies.</p>
+<h3 id="stage-6-storage-layer">Stage 6 — Storage layer<a class="headerlink" href="#stage-6-storage-layer" title="Permanent link">&para;</a></h3>
+<p>SQLite (<code>rusqlite</code> + <code>sqlite-vec</code>), HNSW vector index (<code>instant-distance</code>), graph store (<code>neo4rs</code>). Feature-flagged backend for the memory subsystem.</p>
+<h3 id="stage-7-onnx-migration">Stage 7 — ONNX migration<a class="headerlink" href="#stage-7-onnx-migration" title="Permanent link">&para;</a></h3>
+<p>Remove the torch-dependent LLMLingua compressor. Convert remaining ML models (SmartCrusher, IntelligentContext, memory embedders) to ONNX with fixed opset. Run via the <code>ort</code> crate. Remove <code>torch</code>, <code>transformers</code>, <code>sentence-transformers</code>, <code>llmlingua</code> from runtime dependencies.</p>
+<h3 id="stage-8-retire-the-python-proxy">Stage 8 — Retire the Python proxy<a class="headerlink" href="#stage-8-retire-the-python-proxy" title="Permanent link">&para;</a></h3>
+<p>Delete <code>headroom/proxy/server.py</code> and the Python HTTP routes. The Python package (<code>import headroom</code>) continues to exist for SDK users and integration adapters (LangChain, Agno, MCP, Strands), which talk HTTP and don't care which proxy implementation is behind the endpoint.</p>
+<h2 id="what-does-not-change">What does not change<a class="headerlink" href="#what-does-not-change" title="Permanent link">&para;</a></h2>
+<ul>
+<li><code>pip install headroom</code> continues to work.</li>
+<li>The HTTP API contract is preserved.</li>
+<li>LangChain, Agno, MCP, Strands integrations keep working unchanged.</li>
+<li>The CLI, dashboard, eval framework, examples, and documentation site are all unaffected.</li>
+<li>Python contributions remain welcome for integrations, tooling, examples, and any code paths not yet ported.</li>
+</ul>
+<h2 id="contributing">Contributing<a class="headerlink" href="#contributing" title="Permanent link">&para;</a></h2>
+<ul>
+<li><strong>Python contributors</strong> do not need to learn Rust. CI will flag a PR if a Python change diverges from a Rust-ported counterpart; in that case either update both implementations or disable the feature flag for the affected route.</li>
+<li><strong>Rust contributors</strong> should read <code>RUST_DEV.md</code> for workspace setup, then pick a transform or proxy route from the open issues.</li>
+</ul>
+<h2 id="risks-and-open-questions">Risks and open questions<a class="headerlink" href="#risks-and-open-questions" title="Permanent link">&para;</a></h2>
+<ul>
+<li><strong>ONNX export parity</strong> for embedding models: numerical reproducibility must be validated per model before cutover. Some models may resist clean export and require keeping a Python inference path behind PyO3 as a fallback.</li>
+<li><strong>LLMLingua removal</strong> is a feature removal visible to users relying on it; deprecation timing will be announced on Discord before Stage 7 begins.</li>
+<li><strong>PyO3 binding scope</strong>: we may ultimately not need a PyO3-exposed <code>headroom._core</code> at all, if existing Python SDK users are happy with the HTTP contract. Decision deferred to Stage 8.</li>
+</ul>
+<h2 id="references">References<a class="headerlink" href="#references" title="Permanent link">&para;</a></h2>
+<ul>
+<li><code>RUST_DEV.md</code> — developer setup and workspace reference</li>
+<li><code>crates/</code> — Rust sources</li>
+<li><code>tests/parity/</code> — fixtures and parity harness</li>
+<li><code>Makefile</code> — <code>make test</code>, <code>make test-parity</code>, <code>make build-proxy</code>, <code>make build-wheel</code>, <code>make fmt</code>, <code>make lint</code></li>
+</ul>
 
 
 
