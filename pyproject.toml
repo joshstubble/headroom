@@ -1,6 +1,6 @@
 [build-system]
-requires = ["hatchling"]
-build-backend = "hatchling.build"
+requires = ["maturin>=1.5,<2.0"]
+build-backend = "maturin"
 
 [project]
 name = "headroom-ai"
@@ -75,14 +75,10 @@ proxy = [
 code = [
     "tree-sitter-language-pack>=0.10.0",
 ]
-# ML-based compression with Kompress (ModernBERT)
+# ML-based compression with Kompress (ModernBERT).
+# (The legacy [llmlingua] extra was removed in 0.9.x — no live code path used it.
+# Use [ml] for the supported ML compression dependencies.)
 ml = [
-    "torch>=2.0.0",
-    "transformers>=4.30.0",
-]
-# Legacy ML compression (LLMLingua-2 — use [ml] instead for Kompress)
-llmlingua = [
-    "llmlingua>=0.2.0",
     "torch>=2.0.0",
     "transformers>=4.30.0",
 ]
@@ -98,16 +94,42 @@ memory-stack = [
     "qdrant-client>=1.9.0",
     "neo4j>=5.20.0",
 ]
-# Semantic relevance scoring with embeddings
+# Semantic relevance scoring with embeddings.
+# Uses `fastembed` (BAAI/bge-small-en-v1.5 by default — 33M params,
+# 384 dims, ~30 MB int8-quantized ONNX). Same library + model used by
+# the Rust SmartCrusher (`fastembed` crate), giving byte-equal embeddings
+# across the language boundary. Replaced sentence-transformers in
+# Stage 3c.1 — fastembed is faster (~2-3x), smaller (no torch
+# dependency), and outranks all-MiniLM-L6-v2 on MTEB by ~6 points.
 relevance = [
-    "sentence-transformers>=2.2.0",
+    "fastembed>=0.4.0",
     "numpy>=1.24.0",
 ]
 # Image compression (ML-based routing + OCR)
+#
+# OCR backend uses ONNX Runtime regardless of Python version. The
+# rapidocr ecosystem split into two flavors after 1.4.x:
+#   * rapidocr-onnxruntime 1.4.x — bundled-ORT package, capped at
+#     Python <3.13 by its requires-python metadata. Drop-in for our
+#     existing v1 tuple-shaped API call.
+#   * rapidocr 3.x — engine-agnostic core, supports Python 3.13+.
+#     Returns a RapidOCROutput dataclass (txts, scores, boxes, ...).
+#     Needs `onnxruntime` installed separately to use the ORT backend.
+#
+# `headroom/image/compressor.py` adapts both API shapes at runtime via
+# a try/except cascade. See issue #372 for context.
 image = [
     "pillow>=10.0.0",
     "sentencepiece>=0.1.99",  # Required by SigLIP tokenizer (SiglipTokenizer)
-    "rapidocr-onnxruntime>=1.4.0",  # ONNX-native OCR for text extraction from images (~15MB models)
+    # Python 3.6–3.12: keep the proven ORT-bundled package directly.
+    # ~15 MB ONNX models auto-downloaded on first use.
+    "rapidocr-onnxruntime>=1.4.0,<2; python_version<'3.13'",
+    # Python 3.13+: rapidocr-onnxruntime is unavailable (its wheels
+    # declare requires-python<3.13). Use the successor `rapidocr` 3.x
+    # core + `onnxruntime` engine; same ORT backend, just split into
+    # two packages. Total install size and inference speed unchanged.
+    "rapidocr>=3.0,<4; python_version>='3.13'",
+    "onnxruntime>=1.7,<2; python_version>='3.13'",
 ]
 # Report generation
 reports = [
@@ -171,7 +193,7 @@ html = [
 ]
 # Comprehensive LLM benchmarks
 benchmark = [
-    "lm-eval>=0.4.0",
+    "lm-eval[api]>=0.4.0",
     "openai>=1.0.0",
     "anthropic>=0.18.0",
 ]
@@ -208,28 +230,60 @@ all = [
 headroom = "headroom.cli:main"
 
 [project.urls]
-Homepage = "https://github.com/chopratejas/headroom"
-Documentation = "https://github.com/chopratejas/headroom#readme"
+Homepage = "https://headroom-docs.vercel.app"
+Documentation = "https://headroom-docs.vercel.app/docs"
 Repository = "https://github.com/chopratejas/headroom"
 Issues = "https://github.com/chopratejas/headroom/issues"
 Changelog = "https://github.com/chopratejas/headroom/blob/main/CHANGELOG.md"
+# llms.txt convention (llmstxt.org) — point AI agents / LLM crawlers
+# at the auto-generated docs index so they can resolve install paths
+# and entry points without a follow-up fetch.
+"AI / LLM Index" = "https://headroom-docs.vercel.app/llms.txt"
 
-[tool.hatch.build.targets.wheel]
-packages = ["headroom"]
-# Include non-Python files (dashboard templates, etc.)
-artifacts = [
-    "headroom/dashboard/templates/*.html",
-]
+# Maturin builds a single wheel containing both the Python source under
+# `headroom/` AND the compiled Rust extension `headroom/_core.so` (cdylib
+# from `crates/headroom-py`). One `pip install headroom-ai` ships everything
+# atomically — no separate `headroom-core-py` package, no chicken-and-egg,
+# no PIP_FIND_LINKS plumbing. Phase A0's runtime fail-loud check still
+# exists but only fires if someone forces an sdist install on a platform
+# without a wheel and the rust toolchain isn't available to compile it.
+# Pin the project's package index to public PyPI. Without this, `uv lock`
+# inherits the developer's user-level `~/.config/uv/uv.toml` index
+# setting — including private/internal mirrors like
+# `pypi.netflix.net/simple` — and bakes those URLs into uv.lock, which
+# then breaks CI on every public runner that can't reach the mirror.
+# Declaring the index in pyproject.toml makes the project authoritative
+# regardless of who runs `uv lock`.
+[[tool.uv.index]]
+name = "pypi"
+url = "https://pypi.org/simple/"
+default = true
 
-[tool.hatch.build.targets.sdist]
+[tool.maturin]
+# Where the Python package lives. With `python-source = "."` and the
+# package directory `headroom/` at repo root, maturin includes every file
+# under `headroom/` in the wheel — that picks up the dashboard HTML
+# templates and bundled YAML configs. `LICENSE` and `NOTICE` are listed
+# explicitly because maturin sdists do not get the package-directory
+# treatment wheels do, and PEP 639 auto-discovery emits both files into
+# `License-File:` metadata — PyPI rejects sdists whose declared license
+# files are missing from the tarball with `400 License-File X does not
+# exist in distribution file`.
 include = [
-    "/headroom",
-    "/tests",
-    "/LICENSE",
-    "/NOTICE",
-    "/README.md",
-    "/CHANGELOG.md",
+    { path = "LICENSE", format = "sdist" },
+    { path = "NOTICE", format = "sdist" },
 ]
+python-source = "."
+module-name = "headroom._core"
+# The cdylib source lives under `crates/headroom-py`. Maturin invokes
+# `cargo build` with this manifest to produce `_core.cdylib`, then injects
+# the resulting `.so` into the wheel at `headroom/_core.so`.
+manifest-path = "crates/headroom-py/Cargo.toml"
+features = ["extension-module"]
+# Forbid building without the cdylib feature — bare `cargo build` won't
+# produce a usable Python extension. Maturin's default `bindings` is "pyo3"
+# which is correct here (see `crates/headroom-py/src/`).
+bindings = "pyo3"
 
 [tool.ruff]
 target-version = "py310"
@@ -312,6 +366,7 @@ asyncio_mode = "auto"
 markers = [
     "slow: slow tests (model loads, large fixtures)",
     "real_llm: tests that hit real LLM APIs; skipped unless explicitly enabled",
+    "live: opt-in multi-turn tests that hit real upstream APIs; require provider keys",
 ]
 
 [tool.coverage.run]

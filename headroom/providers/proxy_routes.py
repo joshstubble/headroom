@@ -26,6 +26,16 @@ def _api_target(proxy: Any, provider_name: str) -> str:
 
 
 def _select_passthrough_base_url(proxy: Any, headers: dict[str, str]) -> str:
+    # Codex CLI subscription mode hits a wide surface under
+    # `/backend-api/*` (rate-limit polling, agent identity, JWT
+    # refresh, cloud tasks). Without this branch the catchall
+    # routes those to api.openai.com which 404s, and Codex
+    # interprets the failure as "session invalid" and refuses
+    # to use subscription auth at all. The check is a no-op
+    # for non-ChatGPT-authed requests.
+    _, is_chatgpt_auth = _resolve_codex_routing_headers(headers)
+    if is_chatgpt_auth:
+        return "https://chatgpt.com"
     if headers.get("x-goog-api-key"):
         return _api_target(proxy, "gemini")
     if headers.get("api-key"):
@@ -34,6 +44,127 @@ def _select_passthrough_base_url(proxy: Any, headers: dict[str, str]) -> str:
             return azure_base.rstrip("/")
     provider_name = proxy.provider_runtime.model_metadata_provider(headers)
     return _api_target(proxy, provider_name)
+
+
+# Codex ChatGPT-subscription auth doesn't have access to
+# `chatgpt.com/backend-api/models` — that endpoint returns 403 to OAuth
+# bearer tokens (issue #478). Codex polls `/v1/models` every few seconds
+# to populate its model-picker UI, so the 403 storm is noisy and breaks
+# refresh. The fix: when Codex hits `/v1/models` under ChatGPT auth,
+# synthesize an OpenAI-compatible response from the known-supported
+# Codex/ChatGPT model set instead of forwarding to a 403.
+#
+# The list mirrors what Codex itself ships in its built-in model
+# registry (the same models its provider config exposes); it's the
+# safe-by-construction set since these are what `/v1/responses` actually
+# accepts under ChatGPT auth.
+_CHATGPT_AUTH_CODEX_MODELS: tuple[str, ...] = (
+    "gpt-5.5",
+    "gpt-5.4",
+    "gpt-5.3",
+    "gpt-5.2",
+    "gpt-5.1",
+    "gpt-5",
+)
+
+
+def _synthetic_models_list_response() -> Response:
+    """OpenAI-compatible `/v1/models` payload for Codex ChatGPT auth."""
+    import json
+
+    payload = {
+        "object": "list",
+        "data": [
+            {
+                "id": model_id,
+                "object": "model",
+                "created": 0,
+                "owned_by": "openai",
+            }
+            for model_id in _CHATGPT_AUTH_CODEX_MODELS
+        ],
+    }
+    return Response(
+        content=json.dumps(payload),
+        status_code=200,
+        headers={"content-type": "application/json"},
+    )
+
+
+def _synthetic_model_get_response(model_id: str) -> Response:
+    """OpenAI-compatible `/v1/models/{id}` payload."""
+    import json
+
+    if model_id not in _CHATGPT_AUTH_CODEX_MODELS:
+        return Response(
+            content=json.dumps(
+                {
+                    "error": {
+                        "message": f"Model {model_id!r} not available under ChatGPT auth",
+                        "type": "invalid_request_error",
+                        "code": "model_not_found",
+                    }
+                }
+            ),
+            status_code=404,
+            headers={"content-type": "application/json"},
+        )
+    return Response(
+        content=json.dumps(
+            {
+                "id": model_id,
+                "object": "model",
+                "created": 0,
+                "owned_by": "openai",
+            }
+        ),
+        status_code=200,
+        headers={"content-type": "application/json"},
+    )
+
+
+async def _handle_chatgpt_model_metadata(
+    proxy: Any,
+    request: Request,
+    upstream_path: str,
+) -> Response | None:
+    headers = dict(request.headers.items())
+    headers.pop("host", None)
+    headers, is_chatgpt_auth = _resolve_codex_routing_headers(headers)
+    if not is_chatgpt_auth:
+        return None
+
+    # Short-circuit `/backend-api/models[/{id}]` — chatgpt.com returns
+    # 403 here for OAuth tokens; synthesize a Codex-compatible response
+    # locally so the model-picker refresh succeeds (issue #478).
+    if upstream_path == "/backend-api/models":
+        return _synthetic_models_list_response()
+    if upstream_path.startswith("/backend-api/models/"):
+        model_id = upstream_path[len("/backend-api/models/") :]
+        return _synthetic_model_get_response(model_id)
+
+    url = f"https://chatgpt.com{upstream_path}"
+    if request.url.query:
+        url = f"{url}?{request.url.query}"
+
+    body = await request.body()
+    try:
+        assert proxy.http_client is not None
+        resp = await proxy.http_client.request(
+            request.method,
+            url,
+            headers=headers,
+            content=body,
+            timeout=120.0,
+        )
+        return Response(
+            content=resp.content,
+            status_code=resp.status_code,
+            headers=dict(resp.headers),
+        )
+    except Exception as exc:
+        logger.error("Passthrough %s failed: %s", upstream_path, exc)
+        return Response(content=str(exc), status_code=502)
 
 
 def register_provider_routes(app: FastAPI, proxy: Any) -> None:
@@ -191,12 +322,16 @@ def register_provider_routes(app: FastAPI, proxy: Any) -> None:
     async def google_cloudcode_stream_generate_content_v1(request: Request):
         return await proxy.handle_google_cloudcode_stream(request)
 
-    @app.post("/serving-endpoints/{model}/invocations")
-    async def databricks_invocations(request: Request, model: str):
-        return await proxy.handle_databricks_invocations(request, model)
-
     @app.get("/v1/models")
     async def list_models(request: Request):
+        chatgpt_response = await _handle_chatgpt_model_metadata(
+            proxy,
+            request,
+            "/backend-api/models",
+        )
+        if chatgpt_response is not None:
+            return chatgpt_response
+
         provider_name = proxy.provider_runtime.model_metadata_provider(dict(request.headers))
         return await proxy.handle_passthrough(
             request,
@@ -207,6 +342,14 @@ def register_provider_routes(app: FastAPI, proxy: Any) -> None:
 
     @app.get("/v1/models/{model_id}")
     async def get_model(request: Request, model_id: str):
+        chatgpt_response = await _handle_chatgpt_model_metadata(
+            proxy,
+            request,
+            f"/backend-api/models/{model_id}",
+        )
+        if chatgpt_response is not None:
+            return chatgpt_response
+
         provider_name = proxy.provider_runtime.model_metadata_provider(dict(request.headers))
         return await proxy.handle_passthrough(
             request,

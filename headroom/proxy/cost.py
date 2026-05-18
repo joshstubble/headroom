@@ -300,11 +300,17 @@ def merge_cost_stats(
     Each savings layer is reported separately with its own scope:
     - savings_usd: compression savings at model list price (monotonic)
     - cache_savings_usd: prefix cache discount from provider (separate)
-    - cli_tokens_avoided: tokens filtered by rtk (token count only, no $ estimate)
+    - cli_tokens_avoided: tokens filtered by the selected CLI context tool
+      (token count only, no $ estimate)
 
-    The hero metric (savings_usd) is ONLY compression savings priced at
-    the model's published input rate. Cache and CLI are shown separately.
-    This avoids the non-monotonic moving-average repricing bug (#83).
+    The dollar metric (savings_usd) remains ONLY proxy compression savings
+    priced at the model's published input rate. CLI filtering is folded into
+    the dashboard's compression token total, but it has no reliable
+    model-specific dollar estimate because those tokens never reached the
+    proxy request.
+    Prefix cache savings stay separate because they are a provider discount,
+    not token removal. This avoids the non-monotonic moving-average repricing
+    bug (#83).
     """
     if cost_stats is None:
         return None
@@ -318,6 +324,9 @@ def merge_cost_stats(
         "compression_savings_usd": round(compression_savings, 4),
         "cache_savings_usd": round(cache_net, 4),
         "cli_tokens_avoided": cli_tokens_avoided,
+        "cli_filtering_tokens_avoided": cli_tokens_avoided,
+        "cli_tokens_included_in_compression": True,
+        "cli_filtering_tokens_included_in_compression": True,
     }
 
 
@@ -382,7 +391,9 @@ def build_session_summary(
         best_compression = best["savings_pct"]
         best_detail = f"{best['original']:,} → {best['optimized']:,} tokens"
 
-    # Cost summary — savings_usd is compression savings at model list price (monotonic)
+    # Cost summary — dollar savings are proxy-compression only at model list
+    # price. CLI filtering tokens are counted in token savings but have no
+    # model-specific price because they never reached the proxy request.
     cost_stats = proxy.cost_tracker.stats() if proxy.cost_tracker else {}
     cost_with = cost_stats.get("cost_with_headroom_usd", 0.0)
     compression_savings = cost_stats.get("savings_usd", 0.0)
@@ -407,6 +418,14 @@ def build_session_summary(
             "best_compression_pct": best_compression,
             "best_detail": best_detail,
             "total_tokens_removed": metrics.tokens_saved_total,
+            "cli_filtering_tokens_avoided": cli_tokens_avoided,
+            "total_tokens_saved_with_cli_filtering": (
+                metrics.tokens_saved_total + cli_tokens_avoided
+            ),
+            "total_tokens_before_with_cli_filtering": total_tokens_before,
+            "rtk_tokens_avoided": cli_tokens_avoided,
+            "total_tokens_saved_with_rtk": metrics.tokens_saved_total + cli_tokens_avoided,
+            "total_tokens_before_with_rtk": total_tokens_before,
         },
         "uncompressed_requests": {k: v for k, v in uncompressed_reasons.items() if v > 0},
         "cost": {
@@ -417,6 +436,16 @@ def build_session_summary(
             "breakdown": {
                 "cache_savings_usd": round(cache_net, 2),
                 "compression_savings_usd": round(compression_savings, 2),
+                "cli_filtering_savings_usd": None,
+                "cli_filtering_savings_note": (
+                    "CLI filtering tokens are included in token savings only; "
+                    "dollar savings use proxy compression tokens at model list price."
+                ),
+                "rtk_savings_usd": None,
+                "rtk_savings_note": (
+                    "CLI filtering tokens are included in token savings only; dollar savings "
+                    "use proxy compression tokens at model list price."
+                ),
             },
         },
     }
@@ -464,6 +493,19 @@ class CostTracker:
         self._api_cache_write_5m_by_model: dict[str, int] = {}
         self._api_cache_write_1h_by_model: dict[str, int] = {}
         self._api_uncached_by_model: dict[str, int] = {}
+
+    def reset_runtime(self) -> None:
+        """Reset in-memory cost/token counters for local test/debug use."""
+        self._costs.clear()
+        self._last_prune_time = datetime.now()
+        self._tokens_saved_by_model.clear()
+        self._tokens_sent_by_model.clear()
+        self._requests_by_model.clear()
+        self._api_cache_read_by_model.clear()
+        self._api_cache_write_by_model.clear()
+        self._api_cache_write_5m_by_model.clear()
+        self._api_cache_write_1h_by_model.clear()
+        self._api_uncached_by_model.clear()
 
     # Cache resolved model names to avoid repeated litellm lookups.
     # This is critical: litellm.cost_per_token() is synchronous and can block

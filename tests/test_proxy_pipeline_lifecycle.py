@@ -1,7 +1,8 @@
 from __future__ import annotations
 
+import asyncio
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, call, patch
 
 import httpx
 from fastapi.testclient import TestClient
@@ -39,6 +40,37 @@ def _assert_stage_order(stages: list[PipelineStage]) -> None:
     ]
     positions = [stages.index(stage) for stage in expected]
     assert positions == sorted(positions)
+
+
+def test_proxy_shutdown_unloads_image_models() -> None:
+    config = ProxyConfig(
+        optimize=False,
+        image_optimize=False,
+        cache_enabled=False,
+        rate_limit_enabled=False,
+        cost_tracking_enabled=False,
+        log_requests=False,
+        ccr_inject_tool=False,
+        ccr_handle_responses=False,
+        ccr_context_tracking=False,
+    )
+    app = create_app(config)
+    proxy = app.state.proxy
+    proxy.http_client = None
+    proxy.memory_handler = None
+
+    quota_registry = SimpleNamespace(stop_all=AsyncMock())
+    with (
+        patch("headroom.proxy.server.get_quota_registry", return_value=quota_registry),
+        patch("headroom.models.ml_models.MLModelRegistry.unload_prefix") as unload_prefix,
+    ):
+        asyncio.run(proxy.shutdown())
+
+    assert unload_prefix.call_args_list == [
+        call("technique_router:"),
+        call("siglip:"),
+    ]
+    quota_registry.stop_all.assert_awaited_once()
 
 
 def test_openai_chat_pipeline_events_cover_proxy_lifecycle(monkeypatch) -> None:
@@ -79,7 +111,7 @@ def test_openai_chat_pipeline_events_cover_proxy_lifecycle(monkeypatch) -> None:
 
         monkeypatch.setattr("headroom.tokenizers.get_tokenizer", lambda model: _DummyTokenizer())
 
-        async def _fake_retry(method, url, headers, body, stream=False):  # noqa: ANN001
+        async def _fake_retry(method, url, headers, body, stream=False, **kwargs):  # noqa: ANN001
             return httpx.Response(
                 200,
                 json={
@@ -144,7 +176,7 @@ def test_anthropic_messages_pipeline_events_cover_proxy_lifecycle(monkeypatch) -
 
         monkeypatch.setattr("headroom.tokenizers.get_tokenizer", lambda model: _DummyTokenizer())
 
-        async def _fake_retry(method, url, headers, body, stream=False):  # noqa: ANN001
+        async def _fake_retry(method, url, headers, body, stream=False, **kwargs):  # noqa: ANN001
             return httpx.Response(
                 200,
                 json={

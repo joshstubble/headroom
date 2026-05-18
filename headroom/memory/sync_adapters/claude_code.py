@@ -35,6 +35,21 @@ def _sanitize_for_filename(text: str) -> str:
     return slug or "memory"
 
 
+def encode_claude_project_path(project_path: Path | str) -> str:
+    """Encode a project path the way Claude Code names project directories.
+
+    POSIX absolute paths naturally become ``-Users-me-repo``. Windows drive
+    paths should become ``-C-Users-me-repo`` rather than ``C:-Users-me-repo``.
+    """
+    rendered = str(project_path)
+    drive_match = re.match(r"^([A-Za-z]):[\\/](.*)$", rendered)
+    if drive_match:
+        drive, rest = drive_match.groups()
+        rest = rest.replace("\\", "-").replace("/", "-")
+        return f"-{drive.upper()}-{rest}" if rest else f"-{drive.upper()}"
+    return rendered.replace("/", "-").replace("\\", "-")
+
+
 def _parse_frontmatter(content: str) -> tuple[dict[str, str], str]:
     """Parse YAML frontmatter from a markdown file.
 
@@ -204,21 +219,25 @@ class ClaudeCodeAdapter(AgentMemoryAdapter):
         memory_md.write_text(content, encoding="utf-8")
 
     def fingerprint(self) -> str:
-        """Hash of all .md filenames + mtimes for fast change detection."""
+        """Hash of all .md filenames + contents for change detection."""
         if not self._memory_dir.exists():
             return "empty"
 
-        parts: list[str] = []
+        hasher = hashlib.sha256()
+        found = False
         for md_file in sorted(self._memory_dir.glob("*.md")):
             try:
-                stat = md_file.stat()
-                parts.append(f"{md_file.name}:{stat.st_mtime_ns}")
+                hasher.update(md_file.name.encode())
+                hasher.update(b"\0")
+                hasher.update(md_file.read_bytes())
+                hasher.update(b"\0")
+                found = True
             except OSError:
                 continue
 
-        if not parts:
+        if not found:
             return "empty"
-        return hashlib.sha256("|".join(parts).encode()).hexdigest()[:16]
+        return hasher.hexdigest()[:16]
 
 
 def get_claude_memory_dir(project_path: Path | None = None) -> Path:
@@ -228,6 +247,5 @@ def get_claude_memory_dir(project_path: Path | None = None) -> Path:
         ~/.claude/projects/-<sanitized-path>/memory/
     """
     project = project_path or Path.cwd()
-    # Replace both Unix and Windows path separators (Claude Code does the same)
-    sanitized = str(project).replace("/", "-").replace("\\", "-")
+    sanitized = encode_claude_project_path(project)
     return Path.home() / ".claude" / "projects" / sanitized / "memory"

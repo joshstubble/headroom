@@ -6,6 +6,8 @@ description: Install Headroom via pip, npm, or Docker. Includes all Python extra
 ## Python
 
 Headroom requires **Python 3.10+** and is published as `headroom-ai` on PyPI.
+Current release wheels are built for Python **3.10 through 3.13**. If your
+installer is using a newer Python, force a supported interpreter.
 
 ### Core package
 
@@ -38,6 +40,30 @@ You can combine extras:
 
 ```bash
 pip install "headroom-ai[proxy,langchain,ml]"
+```
+
+### pipx
+
+`pipx` creates one virtual environment per app. If that environment uses an
+unsupported Python version, `pipx` may resolve an older compatible Headroom
+release instead of the newest one.
+
+Use Python 3.13 explicitly:
+
+```bash
+pipx install --python python3.13 "headroom-ai[all]"
+```
+
+For a pinned release:
+
+```bash
+pipx install --python python3.13 "headroom-ai[all]==0.21.4"
+```
+
+Check which Python an existing `pipx` environment uses:
+
+```bash
+pipx list
 ```
 
 ### Verify the install
@@ -147,9 +173,9 @@ These variables configure Headroom at runtime. Set them in your shell, `.env` fi
 | Variable | Default | Description |
 |---|---|---|
 | `HEADROOM_PORT` | `8787` | Port the proxy listens on |
-| `HEADROOM_HOST` | `0.0.0.0` | Host the proxy binds to |
-| `HEADROOM_MODE` | `optimize` | Default mode: `optimize`, `audit`, or `passthrough` |
-| `HEADROOM_LOG_LEVEL` | `INFO` | Logging level |
+| `HEADROOM_HOST` | `127.0.0.1` | Host the proxy binds to |
+| `HEADROOM_MODE` | `token` | Default optimization mode: `token` or `cache` |
+| `HEADROOM_TELEMETRY` | enabled | Set to `off` to disable anonymous telemetry |
 
 ### TypeScript SDK
 

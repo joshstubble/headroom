@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib
 from typing import Any
+from unittest.mock import patch
 
 import httpx
 from fastapi.responses import JSONResponse
@@ -117,6 +118,9 @@ def test_proxy_route_helpers_prefer_legacy_targets_and_gemini_passthrough() -> N
         )
         == "https://azure.example/base"
     )
+    assert proxy_routes._select_passthrough_base_url(proxy, {"api-key": "azure"}) == (
+        "https://legacy.anthropic.test"
+    )
     assert proxy_routes._select_passthrough_base_url(proxy, {}) == "https://legacy.anthropic.test"
 
 
@@ -145,7 +149,6 @@ def test_provider_specific_routes_delegate_to_expected_proxy_handlers(monkeypatc
         "handle_gemini_stream_generate_content",
         "handle_gemini_count_tokens",
         "handle_google_cloudcode_stream",
-        "handle_databricks_invocations",
         "handle_google_batch_create",
         "handle_google_batch_results",
         "handle_google_batch_passthrough",
@@ -192,9 +195,6 @@ def test_provider_specific_routes_delegate_to_expected_proxy_handlers(monkeypatc
         )
         assert client.post("/v1/v1internal:streamGenerateContent").json()["handler"] == (
             "handle_google_cloudcode_stream"
-        )
-        assert client.post("/serving-endpoints/demo/invocations").json()["handler"] == (
-            "handle_databricks_invocations"
         )
         assert client.post("/v1beta/models/demo:batchGenerateContent").json()["handler"] == (
             "handle_google_batch_create"
@@ -249,10 +249,12 @@ def test_openai_response_subpath_passthrough_returns_502_on_http_failure() -> No
 
     with TestClient(_app()) as client:
         client.app.state.proxy.http_client = FailingAsyncClient()
-        response = client.post("/v1/responses/compact?trace=1", json={"model": "gpt-4o"})
+        with patch("headroom.providers.proxy_routes.logger") as logger:
+            response = client.post("/v1/responses/compact?trace=1", json={"model": "gpt-4o"})
 
     assert response.status_code == 502
     assert "boom: POST https://api.openai.test/v1/responses/compact?trace=1" in response.text
+    logger.error.assert_called_once()
 
 
 def test_openai_response_subpath_passthrough_uses_openai_target() -> None:
@@ -281,3 +283,138 @@ def test_openai_response_subpath_passthrough_uses_openai_target() -> None:
     assert method == "DELETE"
     assert url == "https://api.openai.test/v1/responses/items/resp_123?trace=7"
     assert headers["authorization"] == "Bearer sk-proj-test"
+
+
+def test_openai_response_subpath_aliases_and_chatgpt_auth_use_expected_targets(monkeypatch) -> None:
+    monkeypatch.setattr(
+        "headroom.providers.proxy_routes._resolve_codex_routing_headers",
+        lambda headers: (headers, True),
+    )
+
+    class FakeAsyncClient:
+        def __init__(self) -> None:
+            self.calls: list[tuple[str, str]] = []
+
+        async def request(self, method, url, **kwargs):  # type: ignore[no-untyped-def]
+            self.calls.append((method, url))
+            return httpx.Response(200, json={"url": url})
+
+        async def aclose(self) -> None:
+            return None
+
+    with TestClient(_app()) as client:
+        fake = FakeAsyncClient()
+        client.app.state.proxy.http_client = fake
+        assert client.get("/v1/codex/responses/items/resp_1").status_code == 200
+        assert client.post("/backend-api/responses/items/resp_2").status_code == 200
+        assert client.delete("/backend-api/codex/responses/items/resp_3").status_code == 200
+
+    assert fake.calls == [
+        ("GET", "https://chatgpt.com/backend-api/codex/responses/items/resp_1"),
+        ("POST", "https://chatgpt.com/backend-api/codex/responses/items/resp_2"),
+        ("DELETE", "https://chatgpt.com/backend-api/codex/responses/items/resp_3"),
+    ]
+
+
+def test_gemini_batch_embed_contents_passthrough_uses_gemini_target(monkeypatch) -> None:
+    calls: list[tuple[str, str, str]] = []
+
+    async def fake_passthrough(self, request, base_url, sub_path="", provider_name=""):  # type: ignore[no-untyped-def]
+        calls.append((request.url.path, base_url, sub_path))
+        return JSONResponse({"base_url": base_url, "sub_path": sub_path, "provider": provider_name})
+
+    monkeypatch.setattr(HeadroomProxy, "handle_passthrough", fake_passthrough)
+
+    with TestClient(_app()) as client:
+        response = client.post("/v1beta/models/demo:batchEmbedContents")
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "base_url": "https://api.gemini.test",
+        "sub_path": "batchEmbedContents",
+        "provider": "gemini",
+    }
+    assert calls == [
+        ("/v1beta/models/demo:batchEmbedContents", "https://api.gemini.test", "batchEmbedContents")
+    ]
+
+
+def test_v1_models_returns_synthetic_list_under_chatgpt_auth() -> None:
+    """Issue #478: under Codex ChatGPT-subscription OAuth, the proxy
+    must NOT forward `/v1/models` to chatgpt.com/backend-api/models
+    (which returns 403). Synthesize an OpenAI-compatible response with
+    the known-supported Codex/ChatGPT model set instead, so Codex's
+    model-picker refresh succeeds.
+    """
+    with TestClient(_app()) as client:
+        # ChatGPT auth detected via Bearer + ChatGPT account header
+        # (mirrors what Codex Desktop sends).
+        response = client.get(
+            "/v1/models",
+            headers={
+                "authorization": "Bearer eyJ-chatgpt-oauth-token",
+                "chatgpt-account-id": "test-account",
+                "originator": "Codex Desktop",
+            },
+        )
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["object"] == "list"
+    assert isinstance(payload["data"], list)
+    assert len(payload["data"]) > 0
+    model_ids = {entry["id"] for entry in payload["data"]}
+    # Spot-check: the model from issue #478's repro log must be present.
+    assert "gpt-5.5" in model_ids
+    for entry in payload["data"]:
+        assert entry["object"] == "model"
+        assert entry["owned_by"] == "openai"
+
+
+def test_v1_models_get_single_synthetic_under_chatgpt_auth() -> None:
+    """The single-model variant (`/v1/models/{id}`) is also called by
+    Codex for some flows. Must return a synthetic OpenAI-compatible
+    payload for known models, 404 for unknown."""
+    with TestClient(_app()) as client:
+        ok = client.get(
+            "/v1/models/gpt-5.5",
+            headers={
+                "authorization": "Bearer eyJ-chatgpt-oauth-token",
+                "chatgpt-account-id": "test-account",
+            },
+        )
+        unknown = client.get(
+            "/v1/models/gpt-99-future",
+            headers={
+                "authorization": "Bearer eyJ-chatgpt-oauth-token",
+                "chatgpt-account-id": "test-account",
+            },
+        )
+    assert ok.status_code == 200
+    assert ok.json() == {
+        "id": "gpt-5.5",
+        "object": "model",
+        "created": 0,
+        "owned_by": "openai",
+    }
+    assert unknown.status_code == 404
+
+
+def test_v1_models_still_forwards_under_non_chatgpt_auth() -> None:
+    """Non-ChatGPT auth (regular API key, Gemini, etc.) must still
+    forward to the upstream provider — only the ChatGPT-OAuth path
+    short-circuits to the synthetic response."""
+    calls: list[tuple[str, str, str]] = []
+
+    async def fake_passthrough(self, request, base_url, sub_path="", provider_name=""):  # type: ignore[no-untyped-def]
+        calls.append((request.url.path, base_url, provider_name))
+        return JSONResponse({"base_url": base_url, "provider": provider_name})
+
+    with patch.object(HeadroomProxy, "handle_passthrough", fake_passthrough):
+        with TestClient(_app()) as client:
+            response = client.get(
+                "/v1/models",
+                headers={"authorization": "Bearer sk-real-api-key"},
+            )
+    assert response.status_code == 200
+    # Forwarded — not synthesized — because no chatgpt-account-id header.
+    assert calls, "Non-ChatGPT-auth /v1/models must forward, not synthesize"

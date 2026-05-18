@@ -6,10 +6,11 @@ Extracted from server.py to keep the codebase maintainable.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import InitVar, dataclass, field
 from datetime import datetime
 from typing import Any, Literal
 
+from headroom.memory import qdrant_env
 from headroom.providers.registry import ProviderApiOverrides
 
 # =============================================================================
@@ -135,16 +136,21 @@ class ProxyConfig:
     # Per-tool compression profiles
     tool_profiles: dict[str, Any] | None = None
 
+    # Opt in to compressing `user` role messages. Off by default because user
+    # content is typically the subject of the request and is part of the
+    # prefix-cache zone. Enable for OpenAI/Azure chat workloads where the bulk
+    # of input lives in user messages (pasted code/text, RAG context) and the
+    # router would otherwise have nothing eligible to compress.
+    # CLI: --compress-user-messages; env: HEADROOM_COMPRESS_USER_MESSAGES=1.
+    compress_user_messages: bool = False
+
     # Read lifecycle management
     read_lifecycle: bool = True
 
-    # Smart content routing
-    smart_routing: bool = True
-
-    # Intelligent context management
-    intelligent_context: bool = True
-    intelligent_context_scoring: bool = True
-    intelligent_context_compress_first: bool = True
+    # Deprecated compatibility argument. ContentRouter is always active in
+    # the Python proxy; accepting this avoids breaking old config constructors
+    # while keeping it out of runtime state.
+    smart_routing: InitVar[bool | None] = None
 
     # Caching
     cache_enabled: bool = True
@@ -176,6 +182,12 @@ class ProxyConfig:
     log_file: str | None = None
     log_full_messages: bool = False
 
+    # Third-party proxy extensions (opt-in only). List of entry-point names
+    # to enable from the `headroom.proxy_extension` group, or `["*"]` for
+    # wildcard. Empty/None means no extensions run, even if installed.
+    # CLI: --proxy-extension <name1,name2>; env: HEADROOM_PROXY_EXTENSIONS.
+    proxy_extensions: list[str] | None = None
+
     # Fallback
     fallback_enabled: bool = False
     fallback_provider: str | None = None
@@ -193,15 +205,34 @@ class ProxyConfig:
     memory_enabled: bool = False
     memory_backend: Literal["local", "qdrant-neo4j"] = "local"
     memory_db_path: str = ""  # Empty = auto: {cwd}/.headroom/memory.db
+    # Per-project memory routing (GH #462). ``project`` (the new default)
+    # gives each resolved workspace its own SQLite DB so cross-project
+    # bleed becomes structurally impossible. ``user`` partitions by
+    # x-headroom-user-id only. ``global`` keeps the pre-fix single-DB
+    # behaviour (existing memories remain reachable here).
+    memory_storage_mode: Literal["project", "user", "global"] = "project"
+    memory_project_root_override: str = ""
     memory_inject_tools: bool = True
     traffic_learning_enabled: bool = False
     traffic_learning_agent_type: str = "unknown"  # Which agent is being wrapped
+    # Minimum evidence count before a learned pattern is persisted to memory.
+    # Higher values reduce one-shot noise at the cost of slower learning.
+    traffic_learning_min_evidence: int = 5
     memory_use_native_tool: bool = False
     memory_inject_context: bool = True
     memory_top_k: int = 10
     memory_min_similarity: float = 0.3
-    memory_qdrant_host: str = "localhost"
-    memory_qdrant_port: int = 6333
+    # PR-B6: Memory injection mode. ``"auto_tail"`` (default) auto-appends
+    # retrieved memory to the latest user message tail (live zone).
+    # ``"tool"`` disables auto-injection — the model must call
+    # ``memory_search`` to retrieve. See REALIGNMENT/04-phase-B-live-zone.md
+    # PR-B6.
+    memory_mode: Literal["auto_tail", "tool"] = "auto_tail"
+    # Qdrant connection (defaults resolve from HEADROOM_QDRANT_* env vars)
+    memory_qdrant_url: str | None = field(default_factory=qdrant_env.qdrant_env_url)
+    memory_qdrant_host: str = field(default_factory=qdrant_env.qdrant_env_host)
+    memory_qdrant_port: int = field(default_factory=qdrant_env.qdrant_env_port)
+    memory_qdrant_api_key: str | None = field(default_factory=qdrant_env.qdrant_env_api_key)
     memory_neo4j_uri: str = "neo4j://localhost:7687"
     memory_neo4j_user: str = "neo4j"
     memory_neo4j_password: str = "password"
@@ -255,6 +286,25 @@ class ProxyConfig:
     # is still holding a pre-upstream slot. Compression already has its own
     # COMPRESSION_TIMEOUT_SECONDS guard; this bounds the memory leg too.
     anthropic_pre_upstream_memory_context_timeout_seconds: float = 2.0
+
+    # Bound the dedicated compression threadpool. CPU-bound Rust work runs
+    # here; the pool is separate from asyncio's default executor so other
+    # ``asyncio.to_thread`` callers (file IO, etc.) are not contended by
+    # compression bursts. ``None`` resolves to ``min(32, (cpu_count or 1) * 4)``,
+    # matching asyncio's default executor sizing today. Lower the cap to
+    # tighten resource use on multi-tenant hosts; raise it to handle larger
+    # bursts. CLI: ``--compression-max-workers``. Env:
+    # ``HEADROOM_COMPRESSION_MAX_WORKERS``.
+    #
+    # Background: ``asyncio.wait_for`` cancellation does NOT propagate into
+    # the threadpool worker that's running Rust code — once the worker has
+    # picked up the task, ``concurrent.futures.Future.cancel()`` returns
+    # ``False`` and the thread runs to completion. A bounded pool lets us
+    # observe the worst case (max queue depth, "leaked" threads that
+    # finished post-deadline) and fail fast under contention rather than
+    # piling unboundedly on the default executor. See
+    # ``HeadroomProxy._run_compression_in_executor``.
+    compression_max_workers: int | None = None
 
     @property
     def provider_api_overrides(self) -> ProviderApiOverrides:

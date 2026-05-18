@@ -1,10 +1,18 @@
 from __future__ import annotations
 
+import asyncio
 import base64
+import builtins
 import json
+from types import SimpleNamespace
+from unittest.mock import patch
+
+import httpx
 
 from headroom.proxy.handlers.anthropic import AnthropicHandlerMixin
 from headroom.proxy.handlers.openai import OpenAIHandlerMixin, _decode_openai_bearer_payload
+from headroom.proxy.helpers import _headroom_bypass_enabled
+from headroom.proxy.server import HeadroomProxy
 
 
 def _jwt(payload: object) -> str:
@@ -24,6 +32,39 @@ class _ImageCompressor:
     def compress(self, messages, provider):  # noqa: ANN001, ANN201
         assert provider == "anthropic"
         return [self._compressed_message]
+
+
+class _FreshCompressor:
+    instances = 0
+
+    def __init__(self):
+        type(self).instances += 1
+
+
+class _TimeoutHttpClient:
+    async def request(self, **kwargs):  # noqa: ANN001, ANN201
+        raise httpx.ConnectTimeout("connect timed out")
+
+
+class _PassthroughRequest:
+    method = "GET"
+    headers = {}
+    url = SimpleNamespace(path="/favicon.ico", query="")
+
+    async def body(self) -> bytes:
+        return b""
+
+
+class _RetryThenSuccessClient:
+    def __init__(self) -> None:
+        self.attempts = 0
+
+    async def post(self, url, content, headers):  # noqa: ANN001, ANN201
+        self.attempts += 1
+        if self.attempts == 1:
+            raise httpx.ConnectTimeout("connect timed out")
+        request = httpx.Request("POST", url, headers=headers, content=content)
+        return httpx.Response(200, request=request, content=b"{}")
 
 
 def test_decode_openai_bearer_payload_handles_missing_and_non_mapping_payloads() -> None:
@@ -70,6 +111,58 @@ def test_openai_handler_prefix_helpers_cover_edge_cases() -> None:
     assert changed == 1
 
 
+def test_headroom_bypass_helper_is_transport_neutral() -> None:
+    assert _headroom_bypass_enabled({"x-headroom-bypass": "true"}) is True
+    assert _headroom_bypass_enabled({"x-headroom-bypass": " TRUE "}) is True
+    assert _headroom_bypass_enabled({"x-headroom-mode": "passthrough"}) is True
+    assert _headroom_bypass_enabled({"x-headroom-mode": " PASSTHROUGH "}) is True
+    assert _headroom_bypass_enabled({"x-headroom-bypass": "false"}) is False
+    assert _headroom_bypass_enabled({}) is False
+    assert _headroom_bypass_enabled(None) is False
+    assert OpenAIHandlerMixin._headroom_bypass_enabled({"x-headroom-bypass": "true"}) is True
+
+
+def test_openai_passthrough_connect_timeout_returns_502() -> None:
+    handler = object.__new__(OpenAIHandlerMixin)
+    handler.http_client = _TimeoutHttpClient()
+
+    async def run():
+        return await handler.handle_passthrough(
+            _PassthroughRequest(),
+            "https://api.openai.com",
+        )
+
+    response = asyncio.run(run())
+
+    assert response.status_code == 502
+    payload = json.loads(response.body)
+    assert payload["error"]["type"] == "connection_error"
+    assert "Failed to connect to upstream API" in payload["error"]["message"]
+
+
+def test_retry_request_retries_connect_timeout() -> None:
+    proxy = object.__new__(HeadroomProxy)
+    proxy.http_client = _RetryThenSuccessClient()
+    proxy.config = SimpleNamespace(
+        retry_enabled=True,
+        retry_max_attempts=2,
+        retry_base_delay_ms=0,
+        retry_max_delay_ms=0,
+    )
+
+    response = asyncio.run(
+        proxy._retry_request(
+            "POST",
+            "https://api.openai.com/v1/responses",
+            {},
+            {"model": "gpt-5"},
+        )
+    )
+
+    assert response.status_code == 200
+    assert proxy.http_client.attempts == 2
+
+
 def test_anthropic_tool_sort_and_context_append_helpers() -> None:
     tools = [
         {"type": "function", "function": {"name": "beta"}},
@@ -96,11 +189,13 @@ def test_anthropic_tool_sort_and_context_append_helpers() -> None:
         "ctx",
         frozen_message_count=0,
     ) == [{"role": "user", "content": "hello\n\nctx"}]
+    # PR-A2 semantics: list-content user messages get the context appended
+    # to the first text block (live-zone-tail injection).
     assert AnthropicHandlerMixin._append_context_to_latest_non_frozen_user_turn(
         [{"role": "user", "content": [{"type": "text", "text": "hello"}]}],
         "ctx",
         frozen_message_count=0,
-    ) == [{"role": "user", "content": [{"type": "text", "text": "hello"}]}]
+    ) == [{"role": "user", "content": [{"type": "text", "text": "hello\n\nctx"}]}]
 
 
 def test_anthropic_image_compression_helper_only_rewrites_latest_eligible_turn() -> None:
@@ -146,6 +241,44 @@ def test_anthropic_image_compression_helper_only_rewrites_latest_eligible_turn()
         frozen_message_count=0,
         compressor=_ImageCompressor(compressed),
     ) == [compressed]
+
+
+def test_proxy_helper_creates_fresh_image_compressors(monkeypatch) -> None:
+    from headroom.proxy import helpers
+
+    monkeypatch.setattr(helpers, "_image_compressor_available", None)
+    _FreshCompressor.instances = 0
+
+    with patch("headroom.image.ImageCompressor", _FreshCompressor):
+        first = helpers._get_image_compressor()
+        second = helpers._get_image_compressor()
+
+    assert isinstance(first, _FreshCompressor)
+    assert isinstance(second, _FreshCompressor)
+    assert first is not second
+    assert _FreshCompressor.instances == 2
+
+
+def test_proxy_helper_caches_image_stack_import_failure(monkeypatch) -> None:
+    from headroom.proxy import helpers
+
+    real_import = builtins.__import__
+    calls = 0
+
+    def fake_import(name, *args, **kwargs):  # noqa: ANN001, ANN202
+        nonlocal calls
+        if name == "headroom.image":
+            calls += 1
+            raise ImportError("image extras unavailable")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(helpers, "_image_compressor_available", None)
+    monkeypatch.setattr(builtins, "__import__", fake_import)
+
+    assert helpers._get_image_compressor() is None
+    assert helpers._get_image_compressor() is None
+    assert calls == 1
+    assert helpers._image_compressor_available is False
 
 
 def test_anthropic_cache_delta_helpers_cover_string_list_and_role_mismatch() -> None:

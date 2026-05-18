@@ -76,10 +76,65 @@ class PrometheusMetrics:
         self.requests_cached = 0
         self.requests_rate_limited = 0
         self.requests_failed = 0
+        self.inbound_requests_total = 0
+        self.inbound_requests_completed = 0
+        self.inbound_requests_active = 0
+        self.inbound_requests_by_method: dict[str, int] = defaultdict(int)
+        self.inbound_requests_by_path: dict[str, int] = defaultdict(int)
+        self.inbound_responses_by_status: dict[str, int] = defaultdict(int)
 
         self.tokens_input_total = 0
         self.tokens_output_total = 0
         self.tokens_saved_total = 0
+        # Sum of tokens we actually attempted to compress across the
+        # session: extracted units that passed all gates + tool-schema
+        # tokens we ran compaction against. Excludes prefix-frozen
+        # content (instructions, user/system messages, prior turns).
+        # This is the right denominator for an "active compression
+        # ratio" — what fraction of the compressible-eligible tokens
+        # did we actually save?
+        self.attempted_input_tokens_total = 0
+
+        # Per-strategy compression counters. Populated lazily as we see
+        # each strategy tag — no hardcoded list of strategies; the keys
+        # come from ContentRouter's `CompressionStrategy.value` and
+        # SmartCrusher's literal `"smart_crusher"`. The forcing
+        # function for catching strategy-level silent regressions:
+        # if SmartCrusher events drop to zero in production, the
+        # `headroom_compressions_total{strategy="smart_crusher"}`
+        # counter shows it on day 1, not week 3.
+        self.compressions_by_strategy: dict[str, int] = defaultdict(int)
+        self.tokens_saved_by_strategy: dict[str, int] = defaultdict(int)
+
+        # Codex WebSocket compression observability. These are intentionally
+        # aggregate counters/sums, not per-unit storage, so /stats can answer
+        # routing questions without growing with traffic volume.
+        self.codex_ws_units_total = 0
+        self.codex_ws_units_modified_total = 0
+        self.codex_ws_units_to_kompress_total = 0
+        self.codex_ws_units_kompress_attempted_total = 0
+        self.codex_ws_units_by_strategy: dict[str, int] = defaultdict(int)
+        self.codex_ws_units_by_category: dict[str, int] = defaultdict(int)
+        self.codex_ws_units_by_content_type: dict[str, int] = defaultdict(int)
+        self.codex_ws_units_by_text_shape: dict[str, int] = defaultdict(int)
+        self.codex_ws_unit_elapsed_ms_sum = 0.0
+        self.codex_ws_unit_elapsed_ms_max = 0.0
+        self.codex_ws_unit_bytes_sum = 0
+        self.codex_ws_unit_tokens_before_sum = 0
+        self.codex_ws_unit_tokens_after_sum = 0
+        self.codex_ws_unit_tokens_saved_sum = 0
+
+        self.codex_ws_frames_attempted_total = 0
+        self.codex_ws_frames_compressed_total = 0
+        self.codex_ws_frames_failed_total = 0
+        self.codex_ws_frames_to_kompress_total = 0
+        self.codex_ws_frames_kompress_attempted_total = 0
+        self.codex_ws_frame_elapsed_ms_sum = 0.0
+        self.codex_ws_frame_elapsed_ms_max = 0.0
+        self.codex_ws_frame_bytes_before_sum = 0
+        self.codex_ws_frame_bytes_after_sum = 0
+        self.codex_ws_frame_attempted_tokens_sum = 0
+        self.codex_ws_frame_tokens_saved_sum = 0
 
         self.latency_sum_ms = 0.0
         self.latency_min_ms = float("inf")
@@ -124,6 +179,16 @@ class PrometheusMetrics:
 
         # Aggregate waste signals
         self.waste_signals_total: dict[str, int] = defaultdict(int)
+
+        # Cumulative ContentRouter protection counts. Each routing pass
+        # categorises every message — `user_msg`, `system_msg`,
+        # `recent_code`, `excluded_tool`, `analysis_ctx`, `small`,
+        # `ratio_too_high`, `already_compressed`, `non_string`,
+        # `content_blocks`. Surfacing these in `/stats` gives operators a
+        # way to diagnose "why is my compression rate low?" — e.g. a high
+        # `user_msg` count on OpenAI/Azure traffic explains why most
+        # input was protected and never reached the compressor (#454).
+        self.router_route_counts: dict[str, int] = defaultdict(int)
 
         # Provider-specific prefix cache tracking
         # Each provider has different cache economics:
@@ -181,6 +246,96 @@ class PrometheusMetrics:
         # string without holding anything.
         self._stage_timing_lock = threading.Lock()
         self._otel_metrics = otel_metrics
+
+    async def reset_runtime(self) -> None:
+        """Reset in-memory request/compression counters for local test/debug use."""
+        async with self._lock:
+            self.requests_total = 0
+            self.requests_by_provider.clear()
+            self.requests_by_model.clear()
+            self.requests_by_stack.clear()
+            self.requests_cached = 0
+            self.requests_rate_limited = 0
+            self.requests_failed = 0
+            self.inbound_requests_total = 0
+            self.inbound_requests_completed = 0
+            self.inbound_requests_active = 0
+            self.inbound_requests_by_method.clear()
+            self.inbound_requests_by_path.clear()
+            self.inbound_responses_by_status.clear()
+
+            self.tokens_input_total = 0
+            self.tokens_output_total = 0
+            self.tokens_saved_total = 0
+            self.attempted_input_tokens_total = 0
+
+            self.compressions_by_strategy.clear()
+            self.tokens_saved_by_strategy.clear()
+
+            self.codex_ws_units_total = 0
+            self.codex_ws_units_modified_total = 0
+            self.codex_ws_units_to_kompress_total = 0
+            self.codex_ws_units_kompress_attempted_total = 0
+            self.codex_ws_units_by_strategy.clear()
+            self.codex_ws_units_by_category.clear()
+            self.codex_ws_units_by_content_type.clear()
+            self.codex_ws_units_by_text_shape.clear()
+            self.codex_ws_unit_elapsed_ms_sum = 0.0
+            self.codex_ws_unit_elapsed_ms_max = 0.0
+            self.codex_ws_unit_bytes_sum = 0
+            self.codex_ws_unit_tokens_before_sum = 0
+            self.codex_ws_unit_tokens_after_sum = 0
+            self.codex_ws_unit_tokens_saved_sum = 0
+
+            self.codex_ws_frames_attempted_total = 0
+            self.codex_ws_frames_compressed_total = 0
+            self.codex_ws_frames_failed_total = 0
+            self.codex_ws_frames_to_kompress_total = 0
+            self.codex_ws_frames_kompress_attempted_total = 0
+            self.codex_ws_frame_elapsed_ms_sum = 0.0
+            self.codex_ws_frame_elapsed_ms_max = 0.0
+            self.codex_ws_frame_bytes_before_sum = 0
+            self.codex_ws_frame_bytes_after_sum = 0
+            self.codex_ws_frame_attempted_tokens_sum = 0
+            self.codex_ws_frame_tokens_saved_sum = 0
+
+            self.latency_sum_ms = 0.0
+            self.latency_min_ms = float("inf")
+            self.latency_max_ms = 0.0
+            self.latency_count = 0
+
+            self.overhead_sum_ms = 0.0
+            self.overhead_min_ms = float("inf")
+            self.overhead_max_ms = 0.0
+            self.overhead_count = 0
+
+            self.ttfb_sum_ms = 0.0
+            self.ttfb_min_ms = float("inf")
+            self.ttfb_max_ms = 0.0
+            self.ttfb_count = 0
+
+            self.transform_timing_sum.clear()
+            self.transform_timing_count.clear()
+            self.transform_timing_max.clear()
+
+            self.waste_signals_total.clear()
+            self.cache_by_provider.clear()
+            self._cache_requests_by_model.clear()
+
+            self.prefix_freeze_busts_avoided = 0
+            self.prefix_freeze_tokens_preserved = 0
+            self.prefix_freeze_compression_foregone = 0
+            self.cache_bust_tokens_lost = 0
+            self.cache_bust_count = 0
+            self.savings_history = []
+
+        with self._stage_timing_lock:
+            self.stage_timing_sum.clear()
+            self.stage_timing_count.clear()
+            self.stage_timing_max.clear()
+            self.ws_session_duration_sum_ms.clear()
+            self.ws_session_duration_count.clear()
+            self.ws_session_duration_max_ms.clear()
 
     def _get_otel_metrics(self) -> HeadroomOtelMetrics:
         return self._otel_metrics or get_otel_metrics()
@@ -242,6 +397,152 @@ class PrometheusMetrics:
             return
         self.requests_by_stack[slug] += 1
 
+    def record_compression(
+        self,
+        strategy: str,
+        original_tokens: int,
+        compressed_tokens: int,
+    ) -> None:
+        """Implements `headroom.transforms.observability.CompressionObserver`.
+
+        Called once per real compression event by the configured
+        transforms (ContentRouter at routing-decision granularity;
+        SmartCrusher at message granularity in the legacy direct-
+        pipeline path). Increments the per-strategy counters that
+        get exported as labelled Prometheus metrics, so silent
+        regressions in any single strategy become visible in the
+        scrape.
+
+        Synchronous + lock-free: `defaultdict(int)` writes are
+        atomic under the GIL for these key types; the proxy serves
+        many requests concurrently and the contention here would be
+        a single dict write per routing decision.
+
+        Tokens saved is `max(0, original - compressed)` — the
+        observer never records "negative savings" even if a
+        compressor goofs and emits more tokens than it received.
+        """
+        self.compressions_by_strategy[strategy] += 1
+        saved = original_tokens - compressed_tokens
+        if saved > 0:
+            self.tokens_saved_by_strategy[strategy] += saved
+
+    def record_router_route_counts(self, counts: dict[str, int]) -> None:
+        """Accumulate ContentRouter routing-category counts for a single
+        pass. The router emits a dict like ``{"user_msg": 12,
+        "recent_code": 4, ...}`` summarising how it categorised each
+        message in that request. Adding these into a long-running
+        counter gives `/stats` a session-level breakdown so operators
+        can see, e.g., that 80% of messages were protected as
+        `user_msg` and only 5% reached the compressor (#454).
+        """
+        for category, count in counts.items():
+            if count > 0:
+                self.router_route_counts[category] += int(count)
+
+    def record_codex_ws_unit(
+        self,
+        *,
+        strategy: str,
+        reason_category: str,
+        elapsed_ms: float,
+        text_bytes: int,
+        tokens_before: int,
+        tokens_after: int,
+        tokens_saved: int,
+        modified: bool,
+        strategy_chain: list[str] | None = None,
+        content_type: str = "unknown",
+        text_shape: str = "unknown",
+    ) -> None:
+        """Record one Codex WS compression unit decision."""
+
+        strategy = strategy or "unknown"
+        reason_category = reason_category or "unknown"
+        chain = strategy_chain or []
+
+        self.codex_ws_units_total += 1
+        self.codex_ws_units_by_strategy[strategy] += 1
+        self.codex_ws_units_by_category[reason_category] += 1
+        self.codex_ws_units_by_content_type[content_type or "unknown"] += 1
+        self.codex_ws_units_by_text_shape[text_shape or "unknown"] += 1
+        if modified:
+            self.codex_ws_units_modified_total += 1
+        if strategy == "kompress":
+            self.codex_ws_units_to_kompress_total += 1
+        if "kompress" in chain or strategy == "kompress":
+            self.codex_ws_units_kompress_attempted_total += 1
+
+        elapsed_ms = max(0.0, float(elapsed_ms))
+        self.codex_ws_unit_elapsed_ms_sum += elapsed_ms
+        self.codex_ws_unit_elapsed_ms_max = max(self.codex_ws_unit_elapsed_ms_max, elapsed_ms)
+        self.codex_ws_unit_bytes_sum += max(0, int(text_bytes))
+        self.codex_ws_unit_tokens_before_sum += max(0, int(tokens_before))
+        self.codex_ws_unit_tokens_after_sum += max(0, int(tokens_after))
+        self.codex_ws_unit_tokens_saved_sum += max(0, int(tokens_saved))
+
+    def record_codex_ws_frame(
+        self,
+        *,
+        elapsed_ms: float,
+        bytes_before: int,
+        bytes_after: int = 0,
+        attempted_tokens: int = 0,
+        tokens_saved: int = 0,
+        modified: bool = False,
+        failed: bool = False,
+        strategy_chain: list[str] | None = None,
+        final_strategies: list[str] | None = None,
+    ) -> None:
+        """Record one Codex WS response.create compression attempt."""
+
+        chain = strategy_chain or []
+        strategies = final_strategies or []
+
+        self.codex_ws_frames_attempted_total += 1
+        if modified:
+            self.codex_ws_frames_compressed_total += 1
+        if failed:
+            self.codex_ws_frames_failed_total += 1
+        if "kompress" in strategies:
+            self.codex_ws_frames_to_kompress_total += 1
+        if "kompress" in chain or "kompress" in strategies:
+            self.codex_ws_frames_kompress_attempted_total += 1
+
+        elapsed_ms = max(0.0, float(elapsed_ms))
+        self.codex_ws_frame_elapsed_ms_sum += elapsed_ms
+        self.codex_ws_frame_elapsed_ms_max = max(self.codex_ws_frame_elapsed_ms_max, elapsed_ms)
+        self.codex_ws_frame_bytes_before_sum += max(0, int(bytes_before))
+        self.codex_ws_frame_bytes_after_sum += max(0, int(bytes_after))
+        self.codex_ws_frame_attempted_tokens_sum += max(0, int(attempted_tokens))
+        self.codex_ws_frame_tokens_saved_sum += max(0, int(tokens_saved))
+
+    def record_inbound_request(self, *, method: str, path: str) -> None:
+        self.inbound_requests_total += 1
+        self.inbound_requests_active += 1
+        self.inbound_requests_by_method[method.upper()] += 1
+        self.inbound_requests_by_path[path] += 1
+
+    def record_inbound_response(self, *, status_code: int | str) -> None:
+        self.inbound_requests_completed += 1
+        self.inbound_requests_active = max(0, self.inbound_requests_active - 1)
+        self.inbound_responses_by_status[str(status_code)] += 1
+
+    def record_inbound_aborted(self, *, reason: str) -> None:
+        self.inbound_requests_completed += 1
+        self.inbound_requests_active = max(0, self.inbound_requests_active - 1)
+        self.inbound_responses_by_status[f"aborted:{reason}"] += 1
+
+    def inbound_snapshot(self) -> dict[str, object]:
+        return {
+            "total": self.inbound_requests_total,
+            "completed": self.inbound_requests_completed,
+            "active": self.inbound_requests_active,
+            "by_method": dict(self.inbound_requests_by_method),
+            "by_path": dict(self.inbound_requests_by_path),
+            "by_status": dict(self.inbound_responses_by_status),
+        }
+
     async def record_request(
         self,
         provider: str,
@@ -260,6 +561,7 @@ class PrometheusMetrics:
         cache_write_5m_tokens: int = 0,
         cache_write_1h_tokens: int = 0,
         uncached_input_tokens: int = 0,
+        attempted_input_tokens: int = 0,
     ):
         """Record metrics for a request."""
         async with self._lock:
@@ -273,6 +575,9 @@ class PrometheusMetrics:
             self.tokens_input_total += input_tokens
             self.tokens_output_total += output_tokens
             self.tokens_saved_total += tokens_saved
+            # See the attribute definition for why this is the right
+            # denominator for the active-compression ratio.
+            self.attempted_input_tokens_total += max(0, int(attempted_input_tokens))
 
             # Track provider-specific prefix cache metrics
             if cache_read_tokens > 0 or cache_write_tokens > 0:
@@ -504,6 +809,27 @@ class PrometheusMetrics:
             )
             _append_metric(
                 lines,
+                name="headroom_inbound_requests_total",
+                metric_type="counter",
+                help_text="All inbound HTTP requests accepted by the proxy",
+                value=self.inbound_requests_total,
+            )
+            _append_metric(
+                lines,
+                name="headroom_inbound_requests_completed_total",
+                metric_type="counter",
+                help_text="Inbound HTTP requests completed or aborted by the proxy",
+                value=self.inbound_requests_completed,
+            )
+            _append_metric(
+                lines,
+                name="headroom_inbound_requests_active",
+                metric_type="gauge",
+                help_text="Inbound HTTP requests currently active in the proxy",
+                value=self.inbound_requests_active,
+            )
+            _append_metric(
+                lines,
                 name="headroom_tokens_input_total",
                 metric_type="counter",
                 help_text="Total input tokens",
@@ -523,6 +849,15 @@ class PrometheusMetrics:
                 help_text="Tokens saved by optimization",
                 value=self.tokens_saved_total,
             )
+            # NOTE: per-strategy compression breakdown is tracked
+            # internally on `self.compressions_by_strategy` and
+            # `self.tokens_saved_by_strategy` (populated by
+            # `record_compression`) but **deliberately not exported
+            # here**. The proxy's metric→Supabase pipeline treats
+            # each metric name as a column, and we cannot add new
+            # columns. The state is still observable for tests +
+            # programmatic introspection; if/when a non-column-
+            # adding export path exists, surface it there.
             _append_metric(
                 lines,
                 name="headroom_latency_ms_sum",

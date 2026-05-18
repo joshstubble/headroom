@@ -10,10 +10,10 @@ import contextlib
 import json
 import logging
 import time
-from datetime import datetime
 from typing import TYPE_CHECKING, Any
 
-from headroom.proxy.helpers import compute_turn_id, jitter_delay_ms
+from headroom.proxy.auth_mode import classify_client
+from headroom.proxy.helpers import jitter_delay_ms
 
 if TYPE_CHECKING:
     from fastapi.responses import Response, StreamingResponse
@@ -24,6 +24,36 @@ import httpx
 from headroom.copilot_auth import apply_copilot_api_auth
 
 logger = logging.getLogger("headroom.proxy")
+
+
+def _parse_completion_tokens_from_sse_chunk(chunk_bytes: bytes) -> int | None:
+    """Extract `usage.completion_tokens` from a single SSE chunk if present.
+
+    Returns the integer count when the chunk carries a usage frame (LiteLLM
+    emits this only when the request included
+    ``stream_options.include_usage=true``), or None when no usage data is
+    present (the typical content-only chunk path) or when the chunk fails
+    to parse. Used by the OpenAI-via-backend stream path to track
+    completion tokens online instead of buffering the entire response.
+    """
+    try:
+        decoded = chunk_bytes.decode("utf-8", errors="replace")
+    except (UnicodeDecodeError, AttributeError):
+        return None
+    for line in decoded.split("\n"):
+        line = line.strip()
+        if not line.startswith("data: ") or line == "data: [DONE]":
+            continue
+        try:
+            data = json.loads(line[6:])
+        except (json.JSONDecodeError, ValueError):
+            continue
+        if not isinstance(data, dict):
+            continue
+        chunk_usage = data.get("usage")
+        if isinstance(chunk_usage, dict):
+            return int(chunk_usage.get("completion_tokens", 0) or 0)
+    return None
 
 
 class StreamingMixin:
@@ -53,14 +83,19 @@ class StreamingMixin:
         cache_creation_input_tokens, cache_creation_ephemeral_5m_input_tokens,
         cache_creation_ephemeral_1h_input_tokens
         Returns None if no usage found in this chunk.
+
+        PR-A8 / P1-8: Decoded via the bytes-buffer SSE splitter so multi-byte
+        characters split across TCP reads do not corrupt downstream parsing.
+        Only complete events (terminated by ``\\n\\n``) are decoded; partial
+        bytes are dropped (this method is single-chunk only — the buffered
+        path is in ``_parse_sse_usage_from_buffer``).
         """
+        from headroom.proxy.helpers import parse_sse_events_from_byte_buffer
+
         try:
-            text = chunk.decode("utf-8", errors="ignore")
-            # SSE format: "data: {...}\n\n" or "event: ...\ndata: {...}\n\n"
-            for line in text.split("\n"):
-                if not line.startswith("data: "):
-                    continue
-                data_str = line[6:].strip()
+            buf = bytearray(chunk)
+            events = parse_sse_events_from_byte_buffer(buf)
+            for _event_name, data_str in events:
                 if not data_str or data_str == "[DONE]":
                     continue
 
@@ -134,79 +169,108 @@ class StreamingMixin:
     ) -> dict[str, int] | None:
         """Parse usage from buffered SSE data, handling split chunks.
 
-        Processes complete SSE events (ending with double newline) from the buffer
-        and removes them from the buffer. Incomplete events are kept in the buffer
-        for the next chunk.
+        Processes complete SSE events (terminated by ``\\n\\n``) from the
+        bytes buffer and removes them from the buffer. Incomplete events
+        are kept in the buffer for the next chunk.
+
+        PR-A8 / P1-8: ``stream_state["sse_buffer"]`` is a ``bytearray``
+        (not ``str``); event boundaries are found in bytes so a multi-byte
+        UTF-8 character split across TCP reads is preserved intact. Each
+        complete event is decoded as UTF-8 only AFTER the boundary is
+        located. Invalid UTF-8 in a *complete* event raises (operator-
+        visible diagnostic, not silent corruption).
         """
+        from headroom.proxy.helpers import parse_sse_events_from_byte_buffer
+
         buffer = stream_state["sse_buffer"]
         usage_found: dict[str, int] = {}
 
-        # Process complete SSE events (separated by double newlines)
-        while "\n\n" in buffer:
-            event_end = buffer.index("\n\n")
-            event_text = buffer[: event_end + 2]
-            buffer = buffer[event_end + 2 :]
+        # Process complete SSE events (separated by double newlines).
+        # ``parse_sse_events_from_byte_buffer`` mutates ``buffer`` in
+        # place, leaving partial-event tail bytes for the next chunk —
+        # since ``buffer`` is the same ``bytearray`` object held by
+        # ``stream_state``, no reassignment is needed.
+        events = parse_sse_events_from_byte_buffer(buffer)
+        for _event_name, data_str in events:
+            if not data_str or data_str == "[DONE]":
+                continue
 
-            # Parse this complete event
-            for line in event_text.split("\n"):
-                if not line.startswith("data: "):
-                    continue
-                data_str = line[6:].strip()
-                if not data_str or data_str == "[DONE]":
-                    continue
+            try:
+                data = json.loads(data_str)
+            except json.JSONDecodeError:
+                continue
 
-                try:
-                    data = json.loads(data_str)
-                except json.JSONDecodeError:
-                    continue
+            if provider == "anthropic":
+                event_type = data.get("type", "")
+                if event_type == "message_start":
+                    msg = data.get("message", {})
+                    msg_usage = msg.get("usage", {})
+                    if msg_usage:
+                        usage_found["input_tokens"] = msg_usage.get("input_tokens", 0)
+                        usage_found["cache_read_input_tokens"] = msg_usage.get(
+                            "cache_read_input_tokens", 0
+                        )
+                        usage_found["cache_creation_input_tokens"] = msg_usage.get(
+                            "cache_creation_input_tokens", 0
+                        )
+                        cache_write_5m, cache_write_1h = self._extract_anthropic_cache_ttl_metrics(
+                            msg_usage
+                        )
+                        usage_found["cache_creation_ephemeral_5m_input_tokens"] = cache_write_5m
+                        usage_found["cache_creation_ephemeral_1h_input_tokens"] = cache_write_1h
+                        logger.debug(
+                            f"[CACHE] Anthropic usage: input={usage_found.get('input_tokens')}, "
+                            f"cache_read={usage_found.get('cache_read_input_tokens')}, "
+                            f"cache_write={usage_found.get('cache_creation_input_tokens')}"
+                        )
+                elif event_type == "message_delta":
+                    delta_usage = data.get("usage", {})
+                    if delta_usage:
+                        usage_found["output_tokens"] = delta_usage.get("output_tokens", 0)
 
-                if provider == "anthropic":
-                    event_type = data.get("type", "")
-                    if event_type == "message_start":
-                        msg = data.get("message", {})
-                        msg_usage = msg.get("usage", {})
-                        if msg_usage:
-                            usage_found["input_tokens"] = msg_usage.get("input_tokens", 0)
-                            usage_found["cache_read_input_tokens"] = msg_usage.get(
-                                "cache_read_input_tokens", 0
-                            )
-                            usage_found["cache_creation_input_tokens"] = msg_usage.get(
-                                "cache_creation_input_tokens", 0
-                            )
-                            cache_write_5m, cache_write_1h = (
-                                self._extract_anthropic_cache_ttl_metrics(msg_usage)
-                            )
-                            usage_found["cache_creation_ephemeral_5m_input_tokens"] = cache_write_5m
-                            usage_found["cache_creation_ephemeral_1h_input_tokens"] = cache_write_1h
-                            logger.debug(
-                                f"[CACHE] Anthropic usage: input={usage_found.get('input_tokens')}, "
-                                f"cache_read={usage_found.get('cache_read_input_tokens')}, "
-                                f"cache_write={usage_found.get('cache_creation_input_tokens')}"
-                            )
-                    elif event_type == "message_delta":
-                        delta_usage = data.get("usage", {})
-                        if delta_usage:
-                            usage_found["output_tokens"] = delta_usage.get("output_tokens", 0)
+            elif provider == "openai":
+                chunk_usage = data.get("usage")
+                if not isinstance(chunk_usage, dict):
+                    response = data.get("response")
+                    if isinstance(response, dict):
+                        chunk_usage = response.get("usage")
+                if isinstance(chunk_usage, dict):
 
-                elif provider == "openai":
-                    chunk_usage = data.get("usage")
-                    if chunk_usage:
-                        usage_found["input_tokens"] = chunk_usage.get("prompt_tokens", 0)
-                        usage_found["output_tokens"] = chunk_usage.get("completion_tokens", 0)
-                        details = chunk_usage.get("prompt_tokens_details") or {}
-                        usage_found["cache_read_input_tokens"] = details.get("cached_tokens", 0)
+                    def _usage_int(value: Any) -> int:
+                        try:
+                            return max(int(value), 0)
+                        except (TypeError, ValueError):
+                            return 0
 
-                elif provider == "gemini":
-                    usage_meta = data.get("usageMetadata")
-                    if usage_meta:
-                        usage_found["input_tokens"] = usage_meta.get("promptTokenCount", 0)
-                        usage_found["output_tokens"] = usage_meta.get("candidatesTokenCount", 0)
-                        usage_found["cache_read_input_tokens"] = usage_meta.get(
-                            "cachedContentTokenCount", 0
+                    # Chat Completions streams report prompt/completion tokens.
+                    # Responses streams report input/output tokens under
+                    # response.usage on response.completed.
+                    input_tokens = chunk_usage.get("prompt_tokens")
+                    if input_tokens is None:
+                        input_tokens = chunk_usage.get("input_tokens", 0)
+                    output_tokens = chunk_usage.get("completion_tokens")
+                    if output_tokens is None:
+                        output_tokens = chunk_usage.get("output_tokens", 0)
+                    usage_found["input_tokens"] = _usage_int(input_tokens)
+                    usage_found["output_tokens"] = _usage_int(output_tokens)
+                    details = (
+                        chunk_usage.get("prompt_tokens_details")
+                        or chunk_usage.get("input_tokens_details")
+                        or {}
+                    )
+                    if isinstance(details, dict):
+                        usage_found["cache_read_input_tokens"] = _usage_int(
+                            details.get("cached_tokens")
                         )
 
-        # Update buffer with remaining incomplete data
-        stream_state["sse_buffer"] = buffer
+            elif provider == "gemini":
+                usage_meta = data.get("usageMetadata")
+                if usage_meta:
+                    usage_found["input_tokens"] = usage_meta.get("promptTokenCount", 0)
+                    usage_found["output_tokens"] = usage_meta.get("candidatesTokenCount", 0)
+                    usage_found["cache_read_input_tokens"] = usage_meta.get(
+                        "cachedContentTokenCount", 0
+                    )
 
         return usage_found if usage_found else None
 
@@ -214,16 +278,28 @@ class StreamingMixin:
         """Parse SSE data to reconstruct the API response JSON.
 
         Args:
-            sse_data: Raw SSE data string.
+            sse_data: Raw SSE data string. Must already be UTF-8 decoded
+                from a complete-events bytes buffer (see
+                ``parse_sse_events_from_byte_buffer``).
             provider: Provider type for parsing.
 
         Returns:
             Reconstructed response dict or None if parsing fails.
+
+        PR-A8 / P1-9: handles all Anthropic delta types per guide §5.1:
+        ``text_delta``, ``input_json_delta``, ``thinking_delta``,
+        ``signature_delta``, ``citations_delta``. Also preserves
+        ``redacted_thinking.data`` and accumulates citations as a list.
         """
         if provider != "anthropic":
             return None  # Only implemented for Anthropic
 
         response: dict[str, Any] = {"content": [], "usage": {}}
+        # Track blocks by their `index` field so out-of-order events
+        # don't corrupt the reconstruction. The current block pointer
+        # remains for backward-compat with code that walks this dict
+        # sequentially, but the index map is the source of truth.
+        blocks_by_index: dict[int, dict[str, Any]] = {}
         current_block: dict[str, Any] | None = None
 
         for line in sse_data.split("\n"):
@@ -251,41 +327,92 @@ class StreamingMixin:
 
             elif event_type == "content_block_start":
                 block = data.get("content_block", {})
+                block_index = data.get("index", len(response["content"]))
+                btype = block.get("type")
                 current_block = {
-                    "type": block.get("type"),
-                    "index": data.get("index", len(response["content"])),
+                    "type": btype,
+                    "index": block_index,
                 }
-                if block.get("type") == "text":
+                if btype == "text":
                     current_block["text"] = block.get("text", "")
-                elif block.get("type") == "tool_use":
+                elif btype == "tool_use":
                     current_block["id"] = block.get("id")
                     current_block["name"] = block.get("name")
                     current_block["input"] = {}
+                elif btype == "thinking":
+                    # Thinking block — accumulate text via
+                    # `thinking_delta`; signature arrives via
+                    # `signature_delta` (single value, not accumulated).
+                    current_block["thinking_buffer"] = block.get("thinking", "")
+                    if "signature" in block:
+                        current_block["signature"] = block["signature"]
+                elif btype == "redacted_thinking":
+                    # Per Anthropic spec §2.7: opaque encrypted reasoning
+                    # block. The `data` field is preserved as-is and
+                    # MUST be replayed unchanged on the next turn for
+                    # signature validation to pass.
+                    if "data" in block:
+                        current_block["data"] = block["data"]
+                blocks_by_index[block_index] = current_block
 
             elif event_type == "content_block_delta":
-                if current_block:
+                # Resolve the target block by index (preferred) or fall
+                # back to current_block for legacy linear streams.
+                idx = data.get("index")
+                target = (blocks_by_index.get(idx) if idx is not None else None) or current_block
+                if target is not None:
                     delta = data.get("delta", {})
-                    if delta.get("type") == "text_delta":
-                        current_block["text"] = current_block.get("text", "") + delta.get(
-                            "text", ""
-                        )
-                    elif delta.get("type") == "input_json_delta":
-                        # Accumulate partial JSON for tool input
+                    dtype = delta.get("type")
+                    if dtype == "text_delta":
+                        target["text"] = target.get("text", "") + delta.get("text", "")
+                    elif dtype == "input_json_delta":
+                        # Accumulate partial JSON for tool input.
                         partial = delta.get("partial_json", "")
-                        current_block["_partial_json"] = (
-                            current_block.get("_partial_json", "") + partial
+                        target["_partial_json"] = target.get("_partial_json", "") + partial
+                    elif dtype == "thinking_delta":
+                        # Accumulate thinking text into the dedicated
+                        # buffer so it never collides with `text` on
+                        # text blocks (separate field per guide §2.7).
+                        target["thinking_buffer"] = target.get("thinking_buffer", "") + delta.get(
+                            "thinking", ""
                         )
+                    elif dtype == "signature_delta":
+                        # Single value, not accumulated. Last-write
+                        # wins per Anthropic spec.
+                        if "signature" in delta:
+                            target["signature"] = delta["signature"]
+                    elif dtype == "citations_delta":
+                        # Append the citation object to the citations
+                        # list so multi-citation blocks reconstruct
+                        # correctly. Per guide §2.5: each delta carries
+                        # one full citation object under `citation`.
+                        citations = target.setdefault("citations", [])
+                        citation = delta.get("citation")
+                        if citation is not None:
+                            citations.append(citation)
 
             elif event_type == "content_block_stop":
-                if current_block:
-                    # Parse accumulated JSON for tool_use blocks
-                    if current_block.get("type") == "tool_use" and "_partial_json" in current_block:
+                idx = data.get("index")
+                target = (blocks_by_index.get(idx) if idx is not None else None) or current_block
+                if target is not None:
+                    # Parse accumulated JSON for tool_use blocks.
+                    if target.get("type") == "tool_use" and "_partial_json" in target:
                         try:
-                            current_block["input"] = json.loads(current_block["_partial_json"])
+                            target["input"] = json.loads(target["_partial_json"])
                         except json.JSONDecodeError:
-                            current_block["input"] = {}
-                        del current_block["_partial_json"]
-                    response["content"].append(current_block)
+                            target["input"] = {}
+                        del target["_partial_json"]
+                    # Materialize the thinking buffer into the
+                    # canonical `thinking` field expected by the
+                    # Anthropic API.
+                    if target.get("type") == "thinking" and "thinking_buffer" in target:
+                        target["thinking"] = target.pop("thinking_buffer")
+                    # Append the block exactly once. `current_block`
+                    # may not match the indexed target if the stream
+                    # interleaved multiple blocks; index-keyed map is
+                    # authoritative.
+                    if target not in response["content"]:
+                        response["content"].append(target)
                     current_block = None
 
             elif event_type == "message_delta":
@@ -457,10 +584,43 @@ class StreamingMixin:
         original_messages: list[dict] | None = None,
         full_sse_data: str = "",
         parsed_response: dict[str, Any] | None = None,
+        client: str | None = None,
     ) -> None:
-        from headroom.proxy.cost import _summarize_transforms
+        from headroom.proxy.outcome import RequestOutcome
 
         total_latency = (time.time() - start_time) * 1000
+
+        # Per-chunk SSE parsing only flushes events terminated by ``\n\n``.
+        # When upstream truncates mid-event (client disconnect, network
+        # drop, connection reset), the message_start (cache_read /
+        # cache_creation) or message_delta (output_tokens) usage events
+        # can sit in the residual buffer and never be parsed — surfacing
+        # as cache_read=cache_write=0 in PERF logs and poisoning the
+        # downstream freeze heuristic for the next request. Append the
+        # terminator so the buffer parser drains whatever's there. The
+        # per-event try/except in the parser swallows incomplete JSON,
+        # so this is safe even when the truncation cut mid-payload.
+        sse_buffer = stream_state.get("sse_buffer")
+        if isinstance(sse_buffer, bytearray) and len(sse_buffer) > 0:
+            sse_buffer.extend(b"\n\n")
+            late_usage = self._parse_sse_usage_from_buffer(stream_state, provider) or {}
+            for key in (
+                "input_tokens",
+                "output_tokens",
+                "cache_read_input_tokens",
+                "cache_creation_input_tokens",
+                "cache_creation_ephemeral_5m_input_tokens",
+                "cache_creation_ephemeral_1h_input_tokens",
+            ):
+                if key not in late_usage:
+                    continue
+                current = stream_state.get(key)
+                # Only fill in unset (None) or default-zero slots so a
+                # real cache_read=0 from earlier in the stream isn't
+                # clobbered by a later partial event.
+                if current is None or current == 0:
+                    stream_state[key] = late_usage[key]
+
         output_tokens = stream_state["output_tokens"]
         if output_tokens is None:
             output_tokens = stream_state["total_bytes"] // 40
@@ -469,29 +629,28 @@ class StreamingMixin:
                 f"estimating {output_tokens} from {stream_state['total_bytes']} bytes"
             )
 
+        provider_input_tokens = stream_state.get("input_tokens")
+        effective_optimized_tokens = optimized_tokens
+        effective_original_tokens = original_tokens
+        if (
+            provider == "openai"
+            and isinstance(provider_input_tokens, int)
+            and provider_input_tokens > 0
+        ):
+            effective_optimized_tokens = provider_input_tokens
+            effective_original_tokens = max(original_tokens, provider_input_tokens + tokens_saved)
+
         cache_read_tokens = stream_state["cache_read_input_tokens"] or 0
         cache_write_tokens = stream_state["cache_creation_input_tokens"] or 0
         cache_write_5m_tokens = stream_state["cache_creation_ephemeral_5m_input_tokens"] or 0
         cache_write_1h_tokens = stream_state["cache_creation_ephemeral_1h_input_tokens"] or 0
-        uncached_input_tokens = max(optimized_tokens - cache_read_tokens - cache_write_tokens, 0)
-
-        num_msgs = len(body.get("messages", []))
-        cache_hit_pct = (
-            round(cache_read_tokens / (cache_read_tokens + cache_write_tokens) * 100)
-            if (cache_read_tokens + cache_write_tokens) > 0
-            else 0
-        )
-        logger.info(
-            f"[{request_id}] PERF "
-            f"model={model} msgs={num_msgs} "
-            f"tok_before={original_tokens} tok_after={optimized_tokens} "
-            f"tok_saved={tokens_saved} "
-            f"cache_read={cache_read_tokens} cache_write={cache_write_tokens} "
-            f"cache_hit_pct={cache_hit_pct} "
-            f"opt_ms={optimization_latency:.0f} "
-            f"transforms={_summarize_transforms(transforms_applied)}"
+        uncached_input_tokens = max(
+            effective_optimized_tokens - cache_read_tokens - cache_write_tokens, 0
         )
 
+        # Prefix-tracker mutation is provider-specific state that lives
+        # outside the metric funnel. Run it before the funnel so the next
+        # request inherits correct prefix state regardless of metric path.
         if prefix_tracker is not None:
             import copy as _copy
 
@@ -518,67 +677,37 @@ class StreamingMixin:
                 original_messages=next_original,
             )
 
-        if self.cost_tracker:
-            self.cost_tracker.record_tokens(
-                model,
-                tokens_saved,
-                optimized_tokens,
-                cache_read_tokens=cache_read_tokens,
-                cache_write_tokens=cache_write_tokens,
-                cache_write_5m_tokens=cache_write_5m_tokens,
-                cache_write_1h_tokens=cache_write_1h_tokens,
-                uncached_tokens=uncached_input_tokens,
-            )
-
-        if getattr(self, "metrics", None) is not None:
-            await self.metrics.record_request(
-                provider=provider,
-                model=model,
-                input_tokens=optimized_tokens,
-                output_tokens=output_tokens,
-                tokens_saved=tokens_saved,
-                latency_ms=total_latency,
-                overhead_ms=optimization_latency,
-                ttfb_ms=stream_state["ttfb_ms"] or total_latency,
-                pipeline_timing=pipeline_timing,
-                cache_read_tokens=cache_read_tokens,
-                cache_write_tokens=cache_write_tokens,
-                cache_write_5m_tokens=cache_write_5m_tokens,
-                cache_write_1h_tokens=cache_write_1h_tokens,
-                uncached_input_tokens=uncached_input_tokens,
-            )
-
-        # Log the request to the in-memory request logger so it shows up in
-        # /stats `recent_requests` and `/transformations/feed`. Without this
-        # the streaming Anthropic path (which is what Claude Code uses) is
-        # invisible to both surfaces — only Bedrock streaming and the
-        # non-streaming Anthropic path were logged previously.
-        if getattr(self, "logger", None) is not None:
-            from headroom.proxy.models import RequestLog
-
-            self.logger.log(
-                RequestLog(
-                    request_id=request_id,
-                    timestamp=datetime.now().isoformat(),
-                    provider=provider,
-                    model=model,
-                    input_tokens_original=original_tokens,
-                    input_tokens_optimized=optimized_tokens,
-                    output_tokens=output_tokens,
-                    tokens_saved=tokens_saved,
-                    savings_percent=(tokens_saved / original_tokens * 100)
-                    if original_tokens > 0
-                    else 0,
-                    optimization_latency_ms=optimization_latency,
-                    total_latency_ms=total_latency,
-                    tags=tags or {},
-                    cache_hit=False,
-                    transforms_applied=transforms_applied,
-                    request_messages=body.get("messages")
-                    if getattr(self.config, "log_full_messages", False)
-                    else None,
-                )
-            )
+        # Active-compression denominator (``attempted_input_tokens``) is
+        # derived inside ``RequestOutcome.from_stream`` as
+        # ``optimized_tokens + tokens_saved``. No frozen_message_count
+        # propagates to the streaming finalizer yet — per-message
+        # live-zone tracking is a follow-up. Without this fallback the
+        # dashboard headline collapses to 0% even when compression is
+        # happening (issue #455).
+        outcome = RequestOutcome.from_stream(
+            body=body,
+            provider=provider,
+            model=model,
+            request_id=request_id,
+            original_tokens=effective_original_tokens,
+            optimized_tokens=effective_optimized_tokens,
+            output_tokens=output_tokens,
+            tokens_saved=tokens_saved,
+            transforms_applied=transforms_applied,
+            total_latency_ms=total_latency,
+            overhead_ms=optimization_latency,
+            tags=tags,
+            client=client,
+            log_full_messages=getattr(self.config, "log_full_messages", False),
+            cache_read_tokens=cache_read_tokens,
+            cache_write_tokens=cache_write_tokens,
+            cache_write_5m_tokens=cache_write_5m_tokens,
+            cache_write_1h_tokens=cache_write_1h_tokens,
+            uncached_input_tokens=uncached_input_tokens,
+            ttfb_ms=stream_state["ttfb_ms"] or total_latency,
+            pipeline_timing=pipeline_timing,
+        )
+        await self._record_request_outcome(outcome)
 
     async def _stream_response(
         self,
@@ -598,6 +727,11 @@ class StreamingMixin:
         pipeline_timing: dict[str, float] | None = None,
         prefix_tracker: Any | None = None,
         original_messages: list[dict] | None = None,
+        *,
+        original_body_bytes: bytes | None = None,
+        body_mutated: bool = True,
+        mutation_reasons: list[str] | None = None,
+        memory_request_ctx: Any | None = None,
     ) -> Response | StreamingResponse:
         """Stream response with metrics tracking and memory tool handling.
 
@@ -614,8 +748,61 @@ class StreamingMixin:
 
         from headroom.proxy.helpers import MAX_SSE_BUFFER_SIZE
 
+        # Identify the harness (codex / claude-code / aider / cursor /
+        # ...) from the *client's* User-Agent before copilot-auth
+        # potentially rewrites headers for upstream.
+        client = classify_client(headers)
         headers = await apply_copilot_api_auth(headers, url=url)
         start_time = time.time()
+
+        # Byte-faithful forwarding (PR-A3, fixes P0-2). Resolve outbound
+        # bytes once before entering the connection-retry loop. When a
+        # transform mutated the body we re-serialize canonically; otherwise
+        # we forward the original client bytes verbatim.
+        from headroom.proxy.helpers import (
+            capture_codex_wire_debug,
+            codex_wire_debug_enabled,
+            log_outbound_request,
+            prepare_outbound_body_bytes,
+        )
+
+        outbound_bytes, outbound_source = prepare_outbound_body_bytes(
+            body=body,
+            original_body_bytes=original_body_bytes,
+            body_mutated=body_mutated,
+        )
+        outbound_headers = {**headers, "content-type": "application/json"}
+        log_outbound_request(
+            forwarder="streaming",
+            method="POST",
+            path=url,
+            body_bytes_count=len(outbound_bytes),
+            body_mutated=body_mutated,
+            mutation_reasons=list(mutation_reasons or []),
+            request_id=request_id,
+            source=outbound_source,
+        )
+        _codex_wire_debug = (
+            codex_wire_debug_enabled() and provider == "openai" and "/responses" in url
+        )
+        if _codex_wire_debug:
+            capture_codex_wire_debug(
+                "http_stream_upstream_request",
+                request_id=request_id,
+                transport="http_sse",
+                direction="headroom_to_upstream",
+                method="POST",
+                url=url,
+                headers=outbound_headers,
+                body=body,
+                metadata={
+                    "body_bytes": len(outbound_bytes),
+                    "body_mutated": body_mutated,
+                    "mutation_reasons": list(mutation_reasons or []),
+                    "tokens_saved": tokens_saved,
+                    "transforms_applied": transforms_applied,
+                },
+            )
 
         # Mutable state for the generator to update
         stream_state: dict[str, Any] = {
@@ -626,7 +813,12 @@ class StreamingMixin:
             "cache_creation_ephemeral_5m_input_tokens": 0,
             "cache_creation_ephemeral_1h_input_tokens": 0,
             "total_bytes": 0,
-            "sse_buffer": "",  # Buffer for incomplete SSE events
+            # Buffer for incomplete SSE events (bytes, per PR-A8 / P1-8).
+            # We split events on the ``\n\n`` byte sequence and decode
+            # each complete event as UTF-8 only after the boundary is
+            # found, so multi-byte characters split across TCP reads do
+            # not corrupt downstream parsing.
+            "sse_buffer": bytearray(),
             "ttfb_ms": None,  # Time to first byte from upstream
         }
 
@@ -648,9 +840,20 @@ class StreamingMixin:
             for attempt in range(retry_attempts):
                 try:
                     _upstream_req = self.http_client.build_request(
-                        "POST", url, json=body, headers=headers
+                        "POST", url, content=outbound_bytes, headers=outbound_headers
                     )
                     upstream_response = await self.http_client.send(_upstream_req, stream=True)
+                    if _codex_wire_debug:
+                        capture_codex_wire_debug(
+                            "http_stream_upstream_response_headers",
+                            request_id=request_id,
+                            transport="http_sse",
+                            direction="upstream_to_headroom",
+                            method="POST",
+                            url=url,
+                            headers=dict(upstream_response.headers),
+                            status_code=upstream_response.status_code,
+                        )
                     break
                 except (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout) as e:
                     last_connect_error = e
@@ -722,6 +925,29 @@ class StreamingMixin:
             finally:
                 await upstream_response.aclose()
 
+            if _codex_wire_debug:
+                _error_text: str | None = None
+                _error_body: Any = None
+                try:
+                    _error_text = error_content.decode("utf-8")
+                    _error_body = json.loads(_error_text)
+                    _error_text = None
+                except Exception:
+                    with contextlib.suppress(Exception):
+                        _error_text = error_content.decode("utf-8", errors="replace")
+                capture_codex_wire_debug(
+                    "http_stream_upstream_error_response",
+                    request_id=request_id,
+                    transport="http_sse",
+                    direction="upstream_to_headroom",
+                    method="POST",
+                    url=url,
+                    headers=response_headers,
+                    body=_error_body,
+                    raw_text=_error_text,
+                    status_code=upstream_response.status_code,
+                )
+
             stream_state["total_bytes"] = len(error_content)
             await self._finalize_stream_response(
                 body=body,
@@ -739,6 +965,7 @@ class StreamingMixin:
                 pipeline_timing=pipeline_timing,
                 prefix_tracker=prefix_tracker,
                 original_messages=original_messages,
+                client=client,
             )
             return Response(
                 content=error_content,
@@ -756,46 +983,73 @@ class StreamingMixin:
 
             # For memory mode, we buffer the response to check for tool calls
             buffered_chunks: list[bytes] = []
-            full_sse_data = ""
+            # Bytes-level mirror of the SSE stream for memory/prefix
+            # tracking. PR-A8 / P1-8: keep this as bytes too — we
+            # decode only after a complete `\n\n`-terminated event has
+            # been collected, so split UTF-8 bytes never produce
+            # corrupted strings.
+            full_sse_bytes = bytearray()
             parsed_response = None  # Set by memory block; used by CCR + prefix tracker
 
             try:
                 async with contextlib.aclosing(upstream_response) as response:
+                    sse_chunk_index = 0
                     async for chunk in response.aiter_bytes():
+                        sse_chunk_index += 1
                         # Record TTFB on first chunk
                         if stream_state["ttfb_ms"] is None:
                             stream_state["ttfb_ms"] = (time.time() - start_time) * 1000
 
                         stream_state["total_bytes"] += len(chunk)
 
-                        # Buffer SSE data to handle chunks split across calls
-                        chunk_str = chunk.decode("utf-8", errors="ignore")
-                        stream_state["sse_buffer"] += chunk_str
+                        # PR-A8 / P1-8: append bytes verbatim. The
+                        # buffer is a ``bytearray`` and event boundaries
+                        # are located in bytes; decoding happens per
+                        # complete event in the SSE splitter helper.
+                        stream_state["sse_buffer"].extend(chunk)
 
-                        # Safety: prevent unbounded buffer growth
+                        # Safety: prevent unbounded buffer growth.
                         if len(stream_state["sse_buffer"]) > MAX_SSE_BUFFER_SIZE:
                             logger.error(
                                 "SSE buffer exceeded maximum size (%d bytes), "
                                 "truncating to prevent memory exhaustion",
                                 MAX_SSE_BUFFER_SIZE,
                             )
-                            stream_state["sse_buffer"] = stream_state["sse_buffer"][
-                                -MAX_SSE_BUFFER_SIZE // 2 :
-                            ]
+                            # Keep the most recent half so an in-flight
+                            # event is more likely to survive.
+                            tail = bytes(stream_state["sse_buffer"][-MAX_SSE_BUFFER_SIZE // 2 :])
+                            stream_state["sse_buffer"] = bytearray(tail)
 
                         # Always stream immediately — buffering breaks
                         # real-time clients (LangGraph, LangChain, etc.)
                         yield chunk
 
+                        if _codex_wire_debug:
+                            capture_codex_wire_debug(
+                                "http_stream_upstream_chunk",
+                                request_id=request_id,
+                                transport="http_sse",
+                                direction="upstream_to_headroom",
+                                method="POST",
+                                url=url,
+                                raw_text=chunk.decode("utf-8", errors="replace"),
+                                metadata={
+                                    "chunk": sse_chunk_index,
+                                    "byte_count": len(chunk),
+                                },
+                            )
+
                         # Buffer SSE data for memory processing and/or prefix tracker
-                        _track_sse = memory_enabled or (
-                            prefix_tracker is not None and provider == "anthropic"
+                        _track_sse = (
+                            _codex_wire_debug
+                            or memory_enabled
+                            or (prefix_tracker is not None and provider == "anthropic")
                         )
                         if _track_sse:
                             if memory_enabled:
                                 buffered_chunks.append(chunk)
-                            full_sse_data += chunk_str
-                            if len(full_sse_data) > MAX_SSE_BUFFER_SIZE:
+                            full_sse_bytes.extend(chunk)
+                            if len(full_sse_bytes) > MAX_SSE_BUFFER_SIZE:
                                 logger.warning(
                                     "Memory-mode SSE buffer exceeded maximum size, "
                                     "disabling memory detection for this request"
@@ -829,6 +1083,14 @@ class StreamingMixin:
                 # Memory tool handling after stream completes
                 # Chunks were already yielded in real-time above, so we only
                 # do silent background processing here — no yielding.
+                #
+                # PR-A8 / P1-8: full_sse_bytes accumulated as bytes; we
+                # decode here in one shot now that the stream is
+                # complete (the entire payload is a closed sequence of
+                # complete events). Invalid UTF-8 at this point would
+                # be an upstream protocol violation — surface loudly.
+                full_sse_data: str = full_sse_bytes.decode("utf-8") if full_sse_bytes else ""
+
                 if memory_enabled and full_sse_data:
                     # Check for Claude Code credential error
                     if "only authorized for use with Claude Code" in full_sse_data:
@@ -854,7 +1116,10 @@ class StreamingMixin:
                         # in SSE streaming mode. The WS and non-streaming paths
                         # handle continuation properly.
                         tool_results = await self.memory_handler.handle_memory_tool_calls(
-                            parsed_response, memory_user_id, provider
+                            parsed_response,
+                            memory_user_id,
+                            provider,
+                            request_context=memory_request_ctx,
                         )
                         if tool_results:
                             logger.info(
@@ -874,6 +1139,27 @@ class StreamingMixin:
                     )
                     if ccr_parsed:
                         self._record_ccr_feedback_from_response(ccr_parsed, provider, request_id)
+                if _codex_wire_debug:
+                    _debug_parsed_response = (
+                        parsed_response
+                        if parsed_response
+                        else self._parse_sse_to_response(full_sse_data, provider)
+                        if full_sse_data
+                        else None
+                    )
+                    capture_codex_wire_debug(
+                        "http_stream_upstream_complete",
+                        request_id=request_id,
+                        transport="http_sse",
+                        direction="upstream_to_headroom",
+                        method="POST",
+                        url=url,
+                        headers=dict(upstream_response.headers),
+                        body=_debug_parsed_response,
+                        raw_text=full_sse_data,
+                        status_code=upstream_response.status_code,
+                        metadata={"total_bytes": stream_state["total_bytes"]},
+                    )
 
             except (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout) as e:
                 logger.error(f"[{request_id}] Connection error to upstream API: {e}")
@@ -897,6 +1183,27 @@ class StreamingMixin:
                 }
                 yield f"event: error\ndata: {json.dumps(error_event)}\n\n".encode()
             finally:
+                # PR-A8 / P1-8: best-effort decode for downstream
+                # finalization. This runs in `finally` so it must not
+                # raise — if the upstream sent invalid bytes mid-stream
+                # we surface them as `errors="strict"` would in the
+                # success path above, but here we accept the
+                # diagnostic-grade fallback so the finalization log
+                # line still emits.
+                try:
+                    _final_full_sse_data: str = (
+                        full_sse_bytes.decode("utf-8") if full_sse_bytes else ""
+                    )
+                except UnicodeDecodeError:
+                    logger.warning(
+                        f"[{request_id}] Final SSE buffer contained invalid UTF-8; "
+                        "downstream finalization will see only the well-formed prefix."
+                    )
+                    # Find the longest valid UTF-8 prefix via the
+                    # incremental decoder; the lossy decoder kwargs
+                    # are forbidden in this module per PR-A8 / P1-8.
+                    decoder = __import__("codecs").getincrementaldecoder("utf-8")()
+                    _final_full_sse_data = decoder.decode(bytes(full_sse_bytes), final=False)
                 await self._finalize_stream_response(
                     body=body,
                     provider=provider,
@@ -913,8 +1220,9 @@ class StreamingMixin:
                     pipeline_timing=pipeline_timing,
                     prefix_tracker=prefix_tracker,
                     original_messages=original_messages,
-                    full_sse_data=full_sse_data,
+                    full_sse_data=_final_full_sse_data,
                     parsed_response=parsed_response,
+                    client=client,
                 )
 
         return StreamingResponse(
@@ -944,16 +1252,23 @@ class StreamingMixin:
         """
         from fastapi.responses import StreamingResponse
 
-        from headroom.proxy.cost import _summarize_transforms
-        from headroom.proxy.models import RequestLog
+        from headroom.proxy.outcome import RequestOutcome
+
+        client = classify_client(headers)
 
         start_time = time.time()
 
-        # Mutable state for the generator
+        # Mutable state for the generator. Cache fields mirror the
+        # native ``_finalize_stream_response`` shape so the PERF log
+        # values match between paths (issue #327).
         stream_state: dict[str, Any] = {
             "input_tokens": 0,
             "output_tokens": 0,
             "ttfb_ms": None,
+            "cache_read_input_tokens": 0,
+            "cache_creation_input_tokens": 0,
+            "cache_creation_ephemeral_5m_input_tokens": 0,
+            "cache_creation_ephemeral_1h_input_tokens": 0,
         }
 
         async def generate():
@@ -978,6 +1293,15 @@ class StreamingMixin:
                         usage = msg.get("usage", {})
                         if "input_tokens" in usage:
                             stream_state["input_tokens"] = usage["input_tokens"]
+                        stream_state["cache_read_input_tokens"] = usage.get(
+                            "cache_read_input_tokens", 0
+                        )
+                        stream_state["cache_creation_input_tokens"] = usage.get(
+                            "cache_creation_input_tokens", 0
+                        )
+                        cw_5m, cw_1h = self._extract_anthropic_cache_ttl_metrics(usage)
+                        stream_state["cache_creation_ephemeral_5m_input_tokens"] = cw_5m
+                        stream_state["cache_creation_ephemeral_1h_input_tokens"] = cw_1h
 
                     # Track output tokens from message_delta
                     if event.event_type == "message_delta":
@@ -998,69 +1322,37 @@ class StreamingMixin:
                 yield f"event: error\ndata: {json.dumps(error_event)}\n\n".encode()
 
             finally:
-                # Record metrics
                 total_latency = (time.time() - start_time) * 1000
-                output_tokens = stream_state["output_tokens"]
-
                 _backend_name = (
                     self.anthropic_backend.name if self.anthropic_backend else "anthropic"
                 )
-                await self.metrics.record_request(
+                # Active-compression denominator derived inside
+                # ``from_stream`` as ``optimized + saved``. Bedrock
+                # doesn't propagate frozen_message_count either — same
+                # fallback as the SSE finalizer (#455).
+                outcome = RequestOutcome.from_stream(
+                    body=body,
                     provider=_backend_name,
                     model=model,
-                    input_tokens=optimized_tokens,
-                    output_tokens=output_tokens,
+                    request_id=request_id,
+                    original_tokens=original_tokens,
+                    optimized_tokens=optimized_tokens,
+                    output_tokens=stream_state["output_tokens"],
                     tokens_saved=tokens_saved,
-                    latency_ms=total_latency,
-                    cached=False,
+                    transforms_applied=transforms_applied,
+                    total_latency_ms=total_latency,
                     overhead_ms=optimization_latency,
+                    tags=tags,
+                    client=client,
+                    log_full_messages=getattr(self.config, "log_full_messages", False),
+                    cache_read_tokens=stream_state["cache_read_input_tokens"],
+                    cache_write_tokens=stream_state["cache_creation_input_tokens"],
+                    cache_write_5m_tokens=stream_state["cache_creation_ephemeral_5m_input_tokens"],
+                    cache_write_1h_tokens=stream_state["cache_creation_ephemeral_1h_input_tokens"],
                     ttfb_ms=stream_state["ttfb_ms"] or 0,
                     pipeline_timing=pipeline_timing,
                 )
-
-                if self.cost_tracker:
-                    self.cost_tracker.record_tokens(model, tokens_saved, optimized_tokens)
-
-                # Log request
-                if self.logger:
-                    self.logger.log(
-                        RequestLog(
-                            request_id=request_id,
-                            timestamp=datetime.now().isoformat(),
-                            provider=_backend_name,
-                            model=model,
-                            input_tokens_original=original_tokens,
-                            input_tokens_optimized=optimized_tokens,
-                            output_tokens=output_tokens,
-                            tokens_saved=tokens_saved,
-                            savings_percent=(tokens_saved / original_tokens * 100)
-                            if original_tokens > 0
-                            else 0,
-                            optimization_latency_ms=optimization_latency,
-                            total_latency_ms=total_latency,
-                            tags=tags,
-                            cache_hit=False,
-                            transforms_applied=transforms_applied,
-                            request_messages=body.get("messages")
-                            if self.config.log_full_messages
-                            else None,
-                            turn_id=compute_turn_id(
-                                model, body.get("system"), body.get("messages")
-                            ),
-                        )
-                    )
-
-                # Structured perf log line for `headroom perf` analysis
-                num_msgs = len(body.get("messages", []))
-                logger.info(
-                    f"[{request_id}] PERF "
-                    f"model={model} msgs={num_msgs} "
-                    f"tok_before={original_tokens} tok_after={optimized_tokens} "
-                    f"tok_saved={tokens_saved} "
-                    f"cache_read=0 cache_write=0 cache_hit_pct=0 "
-                    f"opt_ms={optimization_latency:.0f} "
-                    f"transforms={_summarize_transforms(transforms_applied)}"
-                )
+                await self._record_request_outcome(outcome)
 
         return StreamingResponse(
             generate(),
@@ -1081,20 +1373,57 @@ class StreamingMixin:
         tags: dict[str, str],
         optimization_latency: float,
         pipeline_timing: dict[str, float] | None = None,
+        waste_signals: dict[str, int] | None = None,
     ) -> StreamingResponse:
         """Stream OpenAI chat completion response from backend.
 
-        Routes stream:true requests through the backend's stream_openai_message(),
-        yielding SSE events to the client.
+        Routes stream:true requests through the backend's
+        ``stream_openai_message()``, yielding SSE events to the client.
+        Buffers chunk bytes into ``stream_state["sse_buffer"]`` and
+        incrementally drains complete events via
+        :meth:`_parse_sse_usage_from_buffer` so the final usage frame
+        (LiteLLM/OpenAI emits this only when the request included
+        ``stream_options.include_usage=true``) yields ``prompt_tokens``,
+        ``completion_tokens``, and
+        ``prompt_tokens_details.cached_tokens``. OpenAI exposes no
+        separate cache-write counter, so the write portion is inferred
+        via :func:`_infer_openai_cache_write_tokens`. Memory stays O(1)
+        because the buffer-parser consumes whole events as they arrive.
         """
         from fastapi.responses import StreamingResponse
 
+        from headroom.proxy.handlers.openai import _infer_openai_cache_write_tokens
+        from headroom.proxy.outcome import RequestOutcome
+
         assert self.anthropic_backend is not None
+        client = classify_client(headers)
 
         async def generate():
+            stream_state: dict[str, Any] = {
+                "sse_buffer": bytearray(),
+                "input_tokens": None,
+                "output_tokens": None,
+                "cache_read_input_tokens": None,
+            }
+
+            def _absorb(usage: dict[str, int] | None) -> None:
+                if not usage:
+                    return
+                for key in ("input_tokens", "output_tokens", "cache_read_input_tokens"):
+                    if key in usage and not stream_state.get(key):
+                        stream_state[key] = usage[key]
+
             try:
                 async for sse_chunk in self.anthropic_backend.stream_openai_message(body, headers):
-                    yield sse_chunk.encode() if isinstance(sse_chunk, str) else sse_chunk
+                    chunk_bytes = sse_chunk.encode() if isinstance(sse_chunk, str) else sse_chunk
+                    stream_state["sse_buffer"].extend(chunk_bytes)
+                    _absorb(self._parse_sse_usage_from_buffer(stream_state, "openai"))
+                    # Per-chunk fallback for upstreams that emit only
+                    # ``completion_tokens`` and not a full usage frame.
+                    parsed = _parse_completion_tokens_from_sse_chunk(chunk_bytes)
+                    if parsed is not None and not stream_state["output_tokens"]:
+                        stream_state["output_tokens"] = parsed
+                    yield chunk_bytes
             except Exception as e:
                 logger.error(f"[{request_id}] Backend streaming error: {e}")
                 error_data = {
@@ -1107,18 +1436,67 @@ class StreamingMixin:
                 yield f"data: {json.dumps(error_data)}\n\n".encode()
                 yield b"data: [DONE]\n\n"
             finally:
+                # Late-flush: if upstream truncated the stream mid-event,
+                # the buffer parser hasn't seen the closing ``\n\n`` yet.
+                # Mirror _finalize_stream_response: append the terminator
+                # and drain anything still parseable.
+                buf = stream_state["sse_buffer"]
+                if len(buf) > 0:
+                    buf.extend(b"\n\n")
+                    _absorb(self._parse_sse_usage_from_buffer(stream_state, "openai"))
+
+                # Mirror the non-streaming sibling (``_extract_responses_usage``
+                # in handlers/openai.py): only infer cache metrics when
+                # upstream actually reported a usage frame. Otherwise the
+                # proxy-side ``optimized_tokens`` would masquerade as a
+                # cache write — wrong, and indistinguishable from a real
+                # hit-rate-zero call in the dashboard.
+                upstream_input = stream_state["input_tokens"]
+                output_tokens = stream_state["output_tokens"] or 0
+                cache_read_tokens = stream_state["cache_read_input_tokens"] or 0
+                if upstream_input is None:
+                    cache_write_tokens = 0
+                    uncached_input_tokens = 0
+                    cache_inferred = False
+                else:
+                    cache_write_tokens = _infer_openai_cache_write_tokens(
+                        upstream_input, cache_read_tokens
+                    )
+                    uncached_input_tokens = max(upstream_input - cache_read_tokens, 0)
+                    cache_inferred = True
+
                 total_latency = (time.time() - start_time) * 1000
-                await self.metrics.record_request(
+                # Active-compression denominator for backend-routed
+                # streaming. No per-message live-zone tracking is wired
+                # for this path yet (see the non-streaming sibling in
+                # openai.py for the same caveat), so use the full pre-
+                # comp request size. This keeps active_savings_percent
+                # in sync with proxy_savings_percent for this provider
+                # instead of collapsing the dashboard headline to 0%.
+                outcome = RequestOutcome.from_stream(
+                    body=body,
                     provider=self.anthropic_backend.name,
                     model=model,
-                    input_tokens=optimized_tokens,
-                    output_tokens=0,  # Unknown in streaming
+                    request_id=request_id,
+                    original_tokens=original_tokens,
+                    optimized_tokens=optimized_tokens,
+                    output_tokens=output_tokens,
                     tokens_saved=tokens_saved,
-                    latency_ms=total_latency,
-                    cached=False,
+                    transforms_applied=transforms_applied,
+                    total_latency_ms=total_latency,
                     overhead_ms=optimization_latency,
+                    tags=tags,
+                    client=client,
+                    log_full_messages=getattr(self.config, "log_full_messages", False),
+                    cache_read_tokens=cache_read_tokens,
+                    cache_write_tokens=cache_write_tokens,
+                    uncached_input_tokens=uncached_input_tokens,
+                    cache_inferred=cache_inferred,
                     pipeline_timing=pipeline_timing,
+                    waste_signals=waste_signals,
                 )
+                await self._record_request_outcome(outcome)
+
                 if tokens_saved > 0:
                     logger.info(
                         f"[{request_id}] {model}: {original_tokens:,} → {optimized_tokens:,} "

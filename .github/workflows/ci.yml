@@ -23,6 +23,19 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
 
+      # `pip install -e .` invokes maturin (declared in `[build-system]
+      # requires`) under the hood, which calls cargo to build the Rust
+      # extension. The toolchain has to be available before the install
+      # step, otherwise build-isolation pulls maturin but `cargo` is
+      # missing.
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@1.95.0
+
+      - name: Cache cargo registry + build
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ". -> target"
+
       - name: Cache pip packages
         uses: actions/cache@v4
         with:
@@ -31,10 +44,11 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-pip-${{ matrix.python-version }}-
 
-      - name: Install dependencies
+      - name: Install dependencies (builds Rust extension via maturin)
         run: |
           python -m pip install --upgrade pip
           pip install -e ".[dev]"
+          python -c "from headroom._core import DiffCompressor; print('headroom._core OK:', DiffCompressor)"
 
       - name: Run linting
         if: matrix.python-version == '3.12'
@@ -73,10 +87,19 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Install with relevance extras
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@1.95.0
+
+      - name: Cache cargo registry + build
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ". -> target"
+
+      - name: Install with relevance extras (builds Rust extension via maturin)
         run: |
           python -m pip install --upgrade pip
           pip install -e ".[dev,relevance]"
+          python -c "from headroom._core import SmartCrusher; print('headroom._core OK:', SmartCrusher)"
 
       - name: Run relevance tests
         run: |
@@ -92,7 +115,15 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Install with agno extras
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@1.95.0
+
+      - name: Cache cargo registry + build
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ". -> target"
+
+      - name: Install with agno extras (builds Rust extension via maturin)
         run: |
           python -m pip install --upgrade pip
           pip install -e ".[dev,agno]"
@@ -200,15 +231,29 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.10"
+          python-version: "3.11"
 
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@1.95.0
+
+      - name: Cache cargo registry + build
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ". -> target"
+
+      # Single-wheel build via maturin: produces both the linux wheel and
+      # the platform-independent sdist in one shot. release.yml's matrix
+      # is what builds per-platform wheels for PyPI; this `build` job is
+      # a smoke check that the build system is wired right.
       - name: Install build tools
         run: |
-          python -m pip install --upgrade pip build twine
+          python -m pip install --upgrade pip
+          pip install 'maturin>=1.5,<2.0' twine
 
-      - name: Build package
+      - name: Build wheel + sdist
         run: |
-          python -m build
+          maturin sdist --out dist
+          maturin build --release --out dist
 
       - name: Check package
         run: |

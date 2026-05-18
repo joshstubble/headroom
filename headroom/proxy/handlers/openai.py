@@ -9,6 +9,7 @@ import asyncio
 import base64
 import contextlib
 import copy
+import hashlib
 import json
 import logging
 import os
@@ -17,7 +18,12 @@ import uuid
 from datetime import datetime
 from typing import TYPE_CHECKING, Any
 
-from headroom.proxy.helpers import jitter_delay_ms
+from headroom.proxy.helpers import (
+    COMPRESSION_TIMEOUT_SECONDS,
+    _headroom_bypass_enabled,
+    extract_tags,
+    jitter_delay_ms,
+)
 from headroom.proxy.stage_timer import StageTimer, emit_stage_timings_log
 from headroom.proxy.ws_session_registry import (
     TerminationCause,
@@ -33,8 +39,213 @@ import httpx
 
 from headroom.copilot_auth import apply_copilot_api_auth, build_copilot_upstream_url
 from headroom.pipeline import PipelineStage, summarize_routing_markers
+from headroom.proxy.auth_mode import classify_auth_mode, classify_client
+from headroom.proxy.compression_decision import CompressionDecision
+from headroom.proxy.cost import _summarize_transforms
+from headroom.proxy.outcome import RequestOutcome
 
 logger = logging.getLogger("headroom.proxy")
+
+
+def _codex_ws_text_shape(text: str) -> str:
+    stripped = text.strip()
+    if not stripped:
+        return "empty"
+    if stripped.startswith("```"):
+        return "code_fence"
+    if stripped.startswith("<") and stripped.endswith(">"):
+        return "xml_or_html"
+    if stripped.startswith("["):
+        return "json_array_like"
+    if stripped.startswith("{"):
+        lines = [line for line in stripped.splitlines() if line.strip()]
+        if len(lines) > 1 and all(line.lstrip().startswith("{") for line in lines[:20]):
+            return "jsonl_like"
+        return "json_object_like"
+    if stripped.startswith("Traceback (most recent call last)"):
+        return "traceback"
+    lines = stripped.splitlines()
+    sample = lines[:50]
+    if sample:
+        timestamp_lines = sum(
+            1
+            for line in sample
+            if len(line) >= 10 and line[:4].isdigit() and line[4:5] == "-" and line[7:8] == "-"
+        )
+        level_lines = sum(
+            1
+            for line in sample
+            if any(level in line for level in (" ERROR ", " WARN ", " WARNING ", " INFO "))
+        )
+        search_lines = sum(
+            1
+            for line in sample
+            if ":" in line and line.split(":", 2)[1:2] and line.split(":", 2)[1].isdigit()
+        )
+        if timestamp_lines >= max(2, len(sample) // 5) or level_lines >= max(2, len(sample) // 5):
+            return "log_like"
+        if search_lines >= max(2, len(sample) // 3):
+            return "search_result_like"
+    return "plain_text_like"
+
+
+def _json_debug_dumps(value: Any) -> str:
+    return json.dumps(value, ensure_ascii=False, default=str, separators=(",", ":"))
+
+
+def _log_codex_compression_debug(_event: str, **_payload: Any) -> None:
+    return
+
+
+_CODEX_COMPRESSION_DEBUG_NOOP = _log_codex_compression_debug
+
+
+def _codex_compression_debug_enabled() -> bool:
+    return _log_codex_compression_debug is not _CODEX_COMPRESSION_DEBUG_NOOP
+
+
+def _json_shape(value: str) -> dict[str, Any]:
+    try:
+        parsed = json.loads(value)
+    except Exception as exc:
+        return {"is_json": False, "error": type(exc).__name__}
+    if isinstance(parsed, dict):
+        return {
+            "is_json": True,
+            "kind": "object",
+            "keys": list(parsed.keys()),
+            "length": len(parsed),
+        }
+    if isinstance(parsed, list):
+        return {"is_json": True, "kind": "array", "length": len(parsed)}
+    return {"is_json": True, "kind": type(parsed).__name__}
+
+
+def _routing_log_debug(_router_result: Any) -> list[dict[str, Any]]:
+    return []
+
+
+_OPENAI_TOOL_SCHEMA_DROP_KEYS = {
+    "$id",
+    "$schema",
+    "$comment",
+    "deprecated",
+    "examples",
+    "example",
+    "markdownDescription",
+    "readOnly",
+    "title",
+    "writeOnly",
+}
+
+
+def _json_byte_len(value: Any) -> int:
+    return len(_json_debug_dumps(value).encode("utf-8", errors="replace"))
+
+
+def _compact_openai_tool_schema_value(
+    value: Any,
+) -> Any:
+    if isinstance(value, list):
+        return [_compact_openai_tool_schema_value(item) for item in value]
+
+    if not isinstance(value, dict):
+        return value
+
+    compacted: dict[str, Any] = {}
+    for key, child in value.items():
+        if key in _OPENAI_TOOL_SCHEMA_DROP_KEYS:
+            continue
+
+        if key == "description" and isinstance(child, str):
+            compacted[key] = " ".join(child.split())
+            continue
+
+        compacted[key] = _compact_openai_tool_schema_value(child)
+
+    return compacted
+
+
+def _compact_openai_responses_tools(
+    payload: dict[str, Any],
+) -> tuple[dict[str, Any], bool, int, int]:
+    tools = payload.get("tools")
+    if not isinstance(tools, list) or not tools:
+        return payload, False, 0, 0
+
+    compacted_tools = _compact_openai_tool_schema_value(tools)
+    before = _json_byte_len(tools)
+    after = _json_byte_len(compacted_tools)
+    if after >= before:
+        return payload, False, before, after
+
+    updated = copy.deepcopy(payload)
+    updated["tools"] = compacted_tools
+    return updated, True, before, after
+
+
+def _responses_input_item_text_bytes(item: Any) -> int:
+    if not isinstance(item, dict):
+        return _json_byte_len(item)
+
+    output = item.get("output")
+    if isinstance(output, str):
+        return len(output.encode("utf-8", errors="replace"))
+
+    content = item.get("content")
+    if isinstance(content, str):
+        return len(content.encode("utf-8", errors="replace"))
+    if isinstance(content, list):
+        total = 0
+        for part in content:
+            if isinstance(part, str):
+                total += len(part.encode("utf-8", errors="replace"))
+            elif isinstance(part, dict) and isinstance(part.get("text"), str):
+                total += len(part["text"].encode("utf-8", errors="replace"))
+        return total
+
+    return _json_byte_len(item)
+
+
+def _openai_responses_context_budget(payload: dict[str, Any]) -> dict[str, Any]:
+    payload_bytes = _json_byte_len(payload)
+    buckets: dict[str, int] = {}
+    for key in ("instructions", "tools", "input", "messages", "client_metadata"):
+        if key in payload:
+            buckets[key] = _json_byte_len(payload.get(key))
+
+    other_bytes = max(payload_bytes - sum(buckets.values()), 0)
+    if other_bytes:
+        buckets["other"] = other_bytes
+
+    input_breakdown: dict[str, dict[str, int]] = {}
+    items = payload.get("input") or payload.get("messages")
+    if isinstance(items, list):
+        for item in items:
+            item_type = item.get("type", "unknown") if isinstance(item, dict) else "non_dict"
+            row = input_breakdown.setdefault(
+                str(item_type),
+                {"items": 0, "bytes": 0, "text_bytes": 0},
+            )
+            row["items"] += 1
+            row["bytes"] += _json_byte_len(item)
+            row["text_bytes"] += _responses_input_item_text_bytes(item)
+
+    return {
+        "payload_bytes": payload_bytes,
+        "buckets": {
+            key: {
+                "bytes": value,
+                "pct": (value / payload_bytes * 100.0) if payload_bytes else 0.0,
+            }
+            for key, value in sorted(
+                buckets.items(),
+                key=lambda item: item[1],
+                reverse=True,
+            )
+        },
+        "input_breakdown": input_breakdown,
+    }
 
 
 # Interactive Responses turns are latency-sensitive. Fail open quickly rather
@@ -48,6 +259,53 @@ RESPONSES_CONTEXT_SEARCH_TIMEOUT_SECONDS = 2.0
 # typically sends the first frame within a few hundred milliseconds of the
 # accept) but short enough to bound the damage from a hung peer.
 WS_FIRST_FRAME_TIMEOUT_SECONDS = 60.0
+
+
+def _infer_openai_cache_write_tokens(input_tokens: int, cache_read_tokens: int) -> int:
+    """Infer OpenAI automatic prompt-cache writes from uncached input tokens.
+
+    OpenAI reports prompt-cache reads as ``cached_tokens`` but does not expose a
+    separate write counter. For dashboard observability, the uncached portion of
+    a Codex/OpenAI request is the best available write-volume proxy. OpenAI has
+    no write premium in our cache economics, so this affects cache-write
+    counters, not dollar savings.
+    """
+
+    return max(input_tokens - cache_read_tokens, 0)
+
+
+def _extract_responses_usage(event: dict[str, Any]) -> tuple[int, int, int, int, int]:
+    """Return input/output/cache usage from a Responses event.
+
+    Codex WebSocket streams include usage on ``response.completed`` events.
+    The shape mirrors HTTP Responses usage:
+    ``response.usage.input_tokens`` plus
+    ``response.usage.input_tokens_details.cached_tokens``.
+    """
+
+    if event.get("type") != "response.completed":
+        return 0, 0, 0, 0, 0
+
+    response = event.get("response")
+    if not isinstance(response, dict):
+        response = {}
+    usage = response.get("usage") or event.get("usage")
+    if not isinstance(usage, dict):
+        return 0, 0, 0, 0, 0
+
+    def _int(value: Any) -> int:
+        try:
+            return max(int(value), 0)
+        except (TypeError, ValueError):
+            return 0
+
+    input_tokens = _int(usage.get("input_tokens"))
+    output_tokens = _int(usage.get("output_tokens"))
+    details = usage.get("input_tokens_details")
+    cached_tokens = _int(details.get("cached_tokens")) if isinstance(details, dict) else 0
+    cache_write_tokens = _infer_openai_cache_write_tokens(input_tokens, cached_tokens)
+    uncached_tokens = max(input_tokens - cached_tokens, 0)
+    return input_tokens, output_tokens, cached_tokens, cache_write_tokens, uncached_tokens
 
 
 def _decode_openai_bearer_payload(headers: dict[str, str]) -> dict[str, Any] | None:
@@ -100,6 +358,19 @@ def _resolve_codex_routing_headers(headers: dict[str, str]) -> tuple[dict[str, s
 class OpenAIHandlerMixin:
     """Mixin providing OpenAI API handler methods for HeadroomProxy."""
 
+    OPENAI_RESPONSES_ROUTER_MIN_BYTES = 512
+    OPENAI_RESPONSES_OUTPUT_TYPES = {
+        "custom_tool_call_output",
+        "function_call_output",
+        "local_shell_call_output",
+        "apply_patch_call_output",
+    }
+
+    @staticmethod
+    def _headroom_bypass_enabled(headers: Any) -> bool:
+        """Return True when inbound headers request full passthrough."""
+        return _headroom_bypass_enabled(headers)
+
     @staticmethod
     def _strict_previous_turn_frozen_count(
         messages: list[dict[str, Any]],
@@ -137,6 +408,695 @@ class OpenAIHandlerMixin:
                 changed += 1
         return restored, changed
 
+    def _compress_openai_responses_live_text_units_with_router(
+        self,
+        payload: dict[str, Any],
+        *,
+        model: str,
+        request_id: str,
+        pass_id: str | None = None,
+        timing: dict[str, float] | None = None,
+    ) -> tuple[dict[str, Any], bool, int, list[str], dict[str, int], list[str], int]:
+        """Run ContentRouter on OpenAI Responses text units.
+
+        This is the Responses provider scaffold: it extracts text-bearing
+        request slots into provider-neutral ``CompressionUnit`` objects, lets
+        the shared router enforce role/type policy and choose compressors, then
+        splices accepted replacements back into the Responses payload. Opaque
+        items such as reasoning, compaction, tool calls, and non-string outputs
+        are intentionally not exposed as text units.
+        """
+
+        debug_enabled = _codex_compression_debug_enabled()
+
+        def _log(_event: str, **_fields: Any) -> None:
+            if debug_enabled:
+                _log_codex_compression_debug(
+                    _event,
+                    request_id=request_id,
+                    pass_id=pass_id,
+                    model=model,
+                    **_fields,
+                )
+
+        input_items = payload.get("input")
+        messages_items = payload.get("messages")
+        items = input_items if isinstance(input_items, list) else messages_items
+        if not isinstance(items, list):
+            return payload, False, 0, [], {}, [], 0
+        try:
+            from headroom.transforms.compression_units import (
+                CompressionUnit,
+                RoutedCompressionUnit,
+                compress_unit_with_router,
+                find_content_router,
+            )
+        except Exception as exc:
+            logger.debug(
+                "[%s] CompressionUnit adapter unavailable: %s",
+                request_id,
+                exc,
+            )
+            return payload, False, 0, [], {}, [], 0
+
+        router = find_content_router(self.openai_pipeline)
+        if router is None:
+            logger.debug("[%s] OpenAI Responses ContentRouter unavailable", request_id)
+            return payload, False, 0, [], {}, [], 0
+
+        try:
+            tokenizer = self.openai_provider.get_token_counter(model)
+        except Exception as exc:
+            logger.debug(
+                "[%s] OpenAI Responses ContentRouter tokenizer unavailable: %s",
+                request_id,
+                exc,
+            )
+            return payload, False, 0, [], {}, [], 0
+
+        def _slot_text(item: dict[str, Any]) -> tuple[str, tuple[str, int | None]] | None:
+            # Only tool-output items are eligible for in-place compression.
+            # Message items (user/system/assistant) sit inside the request's
+            # cacheable prefix; mutating them busts prefix caching on every
+            # subsequent turn. Role-level guards in compression_units.py
+            # remain as defense-in-depth.
+            type_tag = item.get("type")
+            if type_tag in self.OPENAI_RESPONSES_OUTPUT_TYPES:
+                output = item.get("output")
+                if isinstance(output, str):
+                    return output, ("output", None)
+            return None
+
+        def _set_slot_text(
+            item: dict[str, Any],
+            slot: tuple[str, int | None],
+            replacement: str,
+        ) -> None:
+            kind, _ = slot
+            if kind == "output":
+                item["output"] = replacement
+
+        headroom_retrieve_call_ids: set[str] = set()
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            if item.get("type") != "function_call":
+                continue
+            name = item.get("name")
+            if isinstance(name, str) and (
+                name == "headroom_retrieve" or name.endswith("__headroom_retrieve")
+            ):
+                call_id = item.get("call_id")
+                if isinstance(call_id, str) and call_id:
+                    headroom_retrieve_call_ids.add(call_id)
+
+        timing_sink: dict[str, float] = timing if timing is not None else {}
+
+        def _add_timing(name: str, started_at: float) -> None:
+            timing_sink[name] = (
+                timing_sink.get(name, 0.0) + (time.perf_counter() - started_at) * 1000.0
+            )
+
+        extraction_started = time.perf_counter()
+        candidates: list[tuple[int, tuple[str, int | None], str]] = []
+        extraction_debug: list[dict[str, Any]] = []
+        for idx, item in enumerate(items):
+            if not isinstance(item, dict):
+                if debug_enabled:
+                    extraction_debug.append(
+                        {
+                            "index": idx,
+                            "eligible": False,
+                            "reason": "item_not_dict",
+                            "item_type": type(item).__name__,
+                            "item": item,
+                        }
+                    )
+                continue
+            item_type = item.get("type")
+            if item_type in self.OPENAI_RESPONSES_OUTPUT_TYPES:
+                call_id = item.get("call_id")
+                if isinstance(call_id, str) and call_id in headroom_retrieve_call_ids:
+                    if debug_enabled:
+                        extraction_debug.append(
+                            {
+                                "index": idx,
+                                "eligible": False,
+                                "reason": "headroom_retrieve_output_protected",
+                                "item_type": item_type,
+                                "call_id": call_id,
+                                "item": item,
+                            }
+                        )
+                    continue
+                slot = _slot_text(item)
+                if slot is not None:
+                    text, slot_ref = slot
+                    candidates.append((idx, slot_ref, text))
+                    if debug_enabled:
+                        extraction_debug.append(
+                            {
+                                "index": idx,
+                                "eligible": True,
+                                "item_type": item_type,
+                                "role": item.get("role"),
+                                "slot": slot_ref,
+                                "text_chars": len(text),
+                                "text_bytes": len(text.encode("utf-8", errors="replace")),
+                                "text_json_shape": _json_shape(text),
+                                "item": item,
+                                "text": text,
+                            }
+                        )
+                else:
+                    if debug_enabled:
+                        extraction_debug.append(
+                            {
+                                "index": idx,
+                                "eligible": False,
+                                "reason": "output_type_without_text_slot",
+                                "item_type": item_type,
+                                "item": item,
+                            }
+                        )
+            else:
+                if debug_enabled:
+                    extraction_debug.append(
+                        {
+                            "index": idx,
+                            "eligible": False,
+                            "reason": "unsupported_item_type",
+                            "item_type": item_type,
+                            "role": item.get("role"),
+                            "item": item,
+                        }
+                    )
+
+        _add_timing("compression_live_unit_extraction", extraction_started)
+        _log(
+            "codex_compression_extraction",
+            item_count=len(items),
+            candidate_count=len(candidates),
+            payload=payload,
+            extraction=extraction_debug,
+        )
+        if not candidates:
+            _log(
+                "codex_compression_payload_result",
+                modified=False,
+                reason="no_candidates",
+                tokens_saved_total=0,
+                transforms=[],
+                input_payload=payload,
+                output_payload=payload,
+            )
+            return payload, False, 0, [], {}, [], 0
+
+        deepcopy_started = time.perf_counter()
+        updated = copy.deepcopy(payload)
+        _add_timing("compression_payload_deepcopy", deepcopy_started)
+        updated_input_items = updated.get("input")
+        updated_messages_items = updated.get("messages")
+        updated_items = (
+            updated_input_items if isinstance(updated_input_items, list) else updated_messages_items
+        )
+        if not isinstance(updated_items, list):
+            return payload, False, 0, [], {}, [], 0
+
+        modified = False
+        tokens_saved_total = 0
+        # `attempted_input_tokens` is the *compressible* portion of the
+        # request — only the tokens we actually fed to the router (i.e.
+        # extracted units that passed the floor + role + cache_zone
+        # gates). It excludes user messages, system prompts, prior-turn
+        # assistant content, and other frozen prefix bytes. This is the
+        # right denominator for the dashboard savings ratio: comparing
+        # tokens_saved against tokens we ATTEMPTED to compress, not
+        # against everything in the request.
+        attempted_input_tokens = 0
+        transforms: list[str] = []
+        routed_units: list[RoutedCompressionUnit] = []
+
+        unit_build_started = time.perf_counter()
+        unit_debug: list[dict[str, Any]] = []
+        for item_idx, slot_ref, original_text in candidates:
+            item = items[item_idx] if item_idx < len(items) else {}
+            item_type = item.get("type", "unknown") if isinstance(item, dict) else "unknown"
+            role = str(item.get("role") or "tool") if isinstance(item, dict) else "tool"
+            unit = CompressionUnit(
+                text=original_text,
+                provider="openai",
+                endpoint="responses",
+                role=role,
+                item_type=str(item_type),
+                cache_zone="live",
+                mutable=True,
+                min_bytes=self.OPENAI_RESPONSES_ROUTER_MIN_BYTES,
+            )
+            routed_units.append(RoutedCompressionUnit(unit=unit, slot=(item_idx, slot_ref)))
+            if debug_enabled:
+                unit_debug.append(
+                    {
+                        "item_index": item_idx,
+                        "slot": slot_ref,
+                        "provider": unit.provider,
+                        "endpoint": unit.endpoint,
+                        "role": unit.role,
+                        "item_type": unit.item_type,
+                        "cache_zone": unit.cache_zone,
+                        "mutable": unit.mutable,
+                        "min_bytes": unit.min_bytes,
+                        "text_chars": len(unit.text),
+                        "text_bytes": len(unit.text.encode("utf-8", errors="replace")),
+                        "text_json_shape": _json_shape(unit.text),
+                        "text": unit.text,
+                    }
+                )
+        _add_timing("compression_unit_build", unit_build_started)
+
+        _log(
+            "codex_compression_units",
+            units=unit_debug,
+        )
+
+        # Tally per-category counts as units stream in so the pass_summary
+        # event below can emit a one-line breakdown — log readers shouldn't
+        # have to re-aggregate from scattered unit_result events.
+        units_by_category: dict[str, int] = {}
+        strategy_chain_union: list[str] = []
+
+        def _compress_routed_unit(
+            routed: RoutedCompressionUnit,
+        ) -> tuple[object, Any, float]:
+            # `elapsed_ms` is pure compute time. Prior to the P2 scheduler
+            # fix this was wall-clock-from-submit, which conflated
+            # semaphore wait with real work — passthrough units showed
+            # `elapsed_ms=60000+` in production logs even though they did
+            # no work. With the semaphore deleted, this timer is honest.
+            unit_started = time.perf_counter()
+            result = compress_unit_with_router(routed.unit, router=router, tokenizer=tokenizer)
+            elapsed_ms = (time.perf_counter() - unit_started) * 1000.0
+            return routed.slot, result, elapsed_ms
+
+        # Units run serially within the frame-level worker thread. Frame-
+        # level parallelism is already provided by
+        # ``self._compression_executor`` (32 workers, sized
+        # ``min(32, cpu*4)``), which `_run_compression_in_executor`
+        # dispatches each frame onto. The prior per-call
+        # ``ThreadPoolExecutor`` + module-global
+        # ``threading.BoundedSemaphore(10)`` caused production cascades
+        # under ≥10 concurrent Codex sessions; both are deleted.
+        router_total_started = time.perf_counter()
+        routed_results = [_compress_routed_unit(routed) for routed in routed_units]
+
+        for _, result, elapsed_ms in routed_results:
+            router_chain = list(result.router_result.strategy_chain) if result.router_result else []
+            router_content_type = (
+                result.router_result.routing_log[0].content_type.value
+                if result.router_result and result.router_result.routing_log
+                else "unknown"
+            )
+            timing_sink["compression_unit_router_total"] = (
+                timing_sink.get("compression_unit_router_total", 0.0) + elapsed_ms
+            )
+            timing_sink[f"compression_unit_router_strategy_{result.strategy}"] = (
+                timing_sink.get(f"compression_unit_router_strategy_{result.strategy}", 0.0)
+                + elapsed_ms
+            )
+            timing_sink[f"compression_unit_router_category_{result.reason_category}"] = (
+                timing_sink.get(f"compression_unit_router_category_{result.reason_category}", 0.0)
+                + elapsed_ms
+            )
+            record_unit = getattr(getattr(self, "metrics", None), "record_codex_ws_unit", None)
+            if record_unit is not None:
+                record_unit(
+                    strategy=result.strategy,
+                    reason_category=result.reason_category,
+                    elapsed_ms=elapsed_ms,
+                    text_bytes=result.text_bytes,
+                    tokens_before=result.tokens_before,
+                    tokens_after=result.tokens_after,
+                    tokens_saved=result.tokens_saved,
+                    modified=result.modified,
+                    strategy_chain=router_chain,
+                    content_type=router_content_type,
+                    text_shape=_codex_ws_text_shape(result.original),
+                )
+            if elapsed_ms >= 1000.0:
+                logger.info(
+                    "[%s] WS /v1/responses slow compression unit "
+                    "elapsed_ms=%.0f strategy=%s category=%s modified=%s "
+                    "content_type=%s text_shape=%s bytes=%d min_bytes=%d "
+                    "tokens_before=%d tokens_after=%d tokens_saved=%d "
+                    "strategy_chain=%s",
+                    request_id,
+                    elapsed_ms,
+                    result.strategy,
+                    result.reason_category,
+                    result.modified,
+                    router_content_type,
+                    _codex_ws_text_shape(result.original),
+                    result.text_bytes,
+                    result.min_bytes,
+                    result.tokens_before,
+                    result.tokens_after,
+                    result.tokens_saved,
+                    router_chain,
+                )
+        _add_timing("compression_units_router_loop", router_total_started)
+
+        apply_started = time.perf_counter()
+        for slot, result, _elapsed_ms in routed_results:
+            item_idx, slot_ref = slot
+            router_chain = list(result.router_result.strategy_chain) if result.router_result else []
+            for s in router_chain:
+                if s not in strategy_chain_union:
+                    strategy_chain_union.append(s)
+            cat = result.reason_category or "applied"
+            units_by_category[cat] = units_by_category.get(cat, 0) + 1
+            # A unit "reached the router" iff the result carries a
+            # router_result OR was modified — both indicate we got
+            # past the early gates. Units that were size-floored,
+            # role-protected, or in a frozen cache_zone don't count.
+            if result.router_result is not None or result.modified:
+                attempted_input_tokens += result.tokens_before
+            if debug_enabled:
+                _log(
+                    "codex_compression_unit_result",
+                    item_index=item_idx,
+                    slot=slot_ref,
+                    modified=result.modified,
+                    reason=result.reason,
+                    reason_category=cat,
+                    text_bytes=result.text_bytes,
+                    min_bytes=result.min_bytes,
+                    strategy=result.strategy,
+                    strategy_chain=router_chain,
+                    tokens_before=result.tokens_before,
+                    tokens_after=result.tokens_after,
+                    tokens_saved=result.tokens_saved,
+                    transforms_applied=result.transforms_applied,
+                    router_strategy=(
+                        result.router_result.strategy_used.value if result.router_result else None
+                    ),
+                    router_summary=result.router_result.summary() if result.router_result else None,
+                    router_routing_log=_routing_log_debug(result.router_result),
+                    router_cache_hit=(
+                        result.router_result.cache_hit if result.router_result else False
+                    ),
+                    original=result.original,
+                    compressed=result.compressed,
+                )
+            if not result.modified:
+                continue
+
+            target_item = updated_items[item_idx]
+            if not isinstance(target_item, dict):
+                continue
+            _set_slot_text(target_item, slot_ref, result.compressed)
+            modified = True
+            tokens_saved_total += result.tokens_saved
+            for transform in result.transforms_applied:
+                if transform not in transforms:
+                    transforms.append(transform)
+        _add_timing("compression_unit_apply_results", apply_started)
+
+        _log(
+            "codex_compression_payload_result",
+            modified=modified,
+            tokens_saved_total=tokens_saved_total,
+            attempted_input_tokens=attempted_input_tokens,
+            transforms=transforms,
+            units_by_category=units_by_category,
+            strategy_chain=strategy_chain_union,
+            input_payload=payload,
+            output_payload=updated if modified else payload,
+        )
+        return (
+            updated,
+            modified,
+            tokens_saved_total,
+            transforms,
+            units_by_category,
+            strategy_chain_union,
+            attempted_input_tokens,
+        )
+
+    def _compress_openai_responses_payload(
+        self,
+        payload: dict[str, Any],
+        *,
+        model: str,
+        request_id: str,
+        timing: dict[str, float] | None = None,
+    ) -> tuple[dict[str, Any], bool, int, list[str], str | None, int, int, int]:
+        """Compress an OpenAI Responses payload through the shared router.
+
+        Provider adapters pass only the inner Responses payload here. This
+        function is envelope-agnostic: it extracts Responses text slots into
+        provider-neutral compression units, lets ContentRouter choose the
+        compressor, then splices accepted replacements back into the payload.
+        """
+
+        timing_sink: dict[str, float] = timing if timing is not None else {}
+
+        def _add_timing(name: str, started_at: float) -> None:
+            timing_sink[name] = (
+                timing_sink.get(name, 0.0) + (time.perf_counter() - started_at) * 1000.0
+            )
+
+        input_serialization_started = time.perf_counter()
+        input_bytes = json.dumps(payload).encode("utf-8")
+        _add_timing("compression_input_json_dump", input_serialization_started)
+        # Codex/Responses requests can re-enter this method many times per
+        # request_id (one per turn over the same websocket). Tag every
+        # event in this single pass with a content-derived id so dashboards
+        # can attribute each unit_result to its originating pass.
+        # Aggregation note: per-pass `tokens_saved` SHOULD sum across
+        # passes — every pass independently avoided sending those tokens
+        # upstream, regardless of any prefix cache the upstream applies.
+        # Identical pass_ids within one request_id indicate idempotent
+        # retries on the same input bytes and are the only thing that
+        # should be deduped.
+        debug_enabled = _codex_compression_debug_enabled()
+        pass_id = hashlib.sha256(input_bytes).hexdigest()[:12] if debug_enabled else None
+        input_context_budget: dict[str, Any] | None = None
+        if debug_enabled:
+            input_context_budget = _openai_responses_context_budget(payload)
+            _log_codex_compression_debug(
+                "codex_compression_payload_input",
+                request_id=request_id,
+                pass_id=pass_id,
+                model=model,
+                input_bytes=len(input_bytes),
+                context_budget=input_context_budget,
+                input_top_level_keys=list(payload.keys()),
+                input_field_type=type(payload.get("input")).__name__,
+                messages_field_type=type(payload.get("messages")).__name__,
+                payload=payload,
+            )
+        working = payload
+        modified = False
+        tokens_saved = 0
+        transforms: list[str] = []
+        reason: str | None = None
+
+        tool_compaction_started = time.perf_counter()
+        compacted_payload, tools_modified, tools_before_bytes, tools_after_bytes = (
+            _compact_openai_responses_tools(working)
+        )
+        _add_timing("compression_tool_schema_compaction", tool_compaction_started)
+        if tools_modified:
+            working = compacted_payload
+            modified = True
+            reason = None
+            transforms.append("openai:responses:tool_schema_compaction")
+            try:
+                tool_token_started = time.perf_counter()
+                tokenizer = self.openai_provider.get_token_counter(model)
+                tokens_saved += max(
+                    0,
+                    tokenizer.count_text(_json_debug_dumps(payload.get("tools")))
+                    - tokenizer.count_text(_json_debug_dumps(working.get("tools"))),
+                )
+                _add_timing("compression_tool_schema_token_count", tool_token_started)
+            except Exception:
+                pass
+            if debug_enabled:
+                _log_codex_compression_debug(
+                    "codex_tool_schema_compaction",
+                    request_id=request_id,
+                    pass_id=pass_id,
+                    model=model,
+                    modified=True,
+                    tools_bytes_before=tools_before_bytes,
+                    tools_bytes_after=tools_after_bytes,
+                    tools_bytes_saved=tools_before_bytes - tools_after_bytes,
+                )
+
+        live_units_started = time.perf_counter()
+        (
+            router_payload,
+            router_modified,
+            router_saved,
+            router_transforms,
+            units_by_category,
+            strategy_chain,
+            router_attempted_tokens,
+        ) = self._compress_openai_responses_live_text_units_with_router(
+            working,
+            model=model,
+            request_id=request_id,
+            pass_id=pass_id,
+            timing=timing_sink,
+        )
+        _add_timing("compression_live_units_total", live_units_started)
+        if router_modified:
+            working = router_payload
+            modified = True
+            reason = None
+            tokens_saved += int(router_saved)
+            transforms.extend(router_transforms)
+        elif not modified:
+            reason = "router_no_compression"
+
+        # Total tokens we *attempted* to compress on this pass:
+        # router-fed unit tokens + the original (pre-compaction) tool
+        # schema tokens we ran schema_compaction against. Excludes
+        # instructions, user messages, prior assistant turns, and
+        # other prefix bytes we never tried to touch — those belong
+        # to the prefix-cache denominator, not the active-compression
+        # one.
+        attempted_input_tokens = int(router_attempted_tokens)
+        if tools_modified:
+            try:
+                attempted_token_started = time.perf_counter()
+                tokenizer = self.openai_provider.get_token_counter(model)
+                attempted_input_tokens += tokenizer.count_text(
+                    _json_debug_dumps(payload.get("tools"))
+                )
+                _add_timing(
+                    "compression_tool_schema_attempted_token_count",
+                    attempted_token_started,
+                )
+            except Exception:
+                pass
+
+        dedupe_started = time.perf_counter()
+        deduped: list[str] = []
+        for transform in transforms:
+            if transform not in deduped:
+                deduped.append(transform)
+        _add_timing("compression_transform_dedupe", dedupe_started)
+
+        output_serialization_started = time.perf_counter()
+        output_bytes = json.dumps(working).encode("utf-8")
+        _add_timing("compression_output_json_dump", output_serialization_started)
+        output_context_budget = _openai_responses_context_budget(working) if debug_enabled else None
+        # One-line summary at INFO — the single event a human reading
+        # logs should scan first to understand "what happened on this
+        # pass". All the verbose per-event debug data stays available
+        # but at DEBUG level. Contains: byte totals, savings, the
+        # strategy chain we walked, unit-outcome counts by category,
+        # and the transforms applied.
+        savings_pct = (
+            (1.0 - len(output_bytes) / len(input_bytes)) * 100.0 if len(input_bytes) else 0.0
+        )
+        # Active-compression ratio: savings as a fraction of what we
+        # *attempted* to compress, not of the whole request. The whole-
+        # request ratio is in `savings_pct`; this one is the metric the
+        # dashboard should display (otherwise frozen prefix bytes drown
+        # the wins from the compressible tail).
+        #
+        # Math note: `attempted_input_tokens` is the pre-compression
+        # size of the eligible content (sum of unit.tokens_before +
+        # original tool schema). `tokens_saved` is what we removed
+        # from it. So the savings rate is plain `saved / attempted` —
+        # NOT `saved / (attempted + saved)`, which would double-count.
+        attempted_pct = (
+            (tokens_saved / attempted_input_tokens) * 100.0 if attempted_input_tokens > 0 else 0.0
+        )
+        if debug_enabled:
+            _log_codex_compression_debug(
+                "codex_compression_pass_summary",
+                request_id=request_id,
+                pass_id=pass_id,
+                model=model,
+                modified=modified,
+                reason=reason,
+                input_bytes=len(input_bytes),
+                output_bytes=len(output_bytes),
+                bytes_saved=len(input_bytes) - len(output_bytes),
+                savings_pct=round(savings_pct, 2),
+                tokens_saved=tokens_saved,
+                attempted_input_tokens=attempted_input_tokens,
+                attempted_pct=round(attempted_pct, 2),
+                strategy_chain=strategy_chain,
+                units_by_category=units_by_category,
+                transforms=deduped,
+            )
+            _log_codex_compression_debug(
+                "codex_compression_payload_output",
+                request_id=request_id,
+                pass_id=pass_id,
+                model=model,
+                modified=modified,
+                reason=reason,
+                tokens_saved=tokens_saved,
+                attempted_input_tokens=attempted_input_tokens,
+                transforms=deduped,
+                input_bytes=len(input_bytes),
+                output_bytes=len(output_bytes),
+                context_budget_before=input_context_budget,
+                context_budget_after=output_context_budget,
+                input_payload=payload,
+                output_payload=working,
+            )
+        return (
+            working,
+            modified,
+            tokens_saved,
+            deduped,
+            reason,
+            len(input_bytes),
+            len(output_bytes),
+            attempted_input_tokens,
+        )
+
+    async def _compress_openai_responses_payload_in_executor(
+        self,
+        payload: dict[str, Any],
+        *,
+        model: str,
+        request_id: str,
+    ) -> tuple[dict[str, Any], bool, int, list[str], str | None, int, int, int, dict[str, float]]:
+        timing: dict[str, float] = {}
+
+        def _compress():  # noqa: ANN202
+            try:
+                return self._compress_openai_responses_payload(
+                    payload,
+                    model=model,
+                    request_id=request_id,
+                    timing=timing,
+                )
+            except TypeError as exc:
+                if "unexpected keyword argument 'timing'" not in str(exc):
+                    raise
+                return self._compress_openai_responses_payload(
+                    payload,
+                    model=model,
+                    request_id=request_id,
+                )
+
+        result = await self._run_compression_in_executor(
+            _compress,
+            timeout=COMPRESSION_TIMEOUT_SECONDS,
+        )
+        if len(result) == 8:
+            return (*result, timing)
+        return result
+
     async def handle_openai_chat(
         self,
         request: Request,
@@ -163,6 +1123,14 @@ class OpenAIHandlerMixin:
 
         start_time = time.time()
         request_id = await self._next_request_id()
+
+        # Phase F PR-F1: classify auth mode at request entry. The result
+        # is stored on `request.state` so downstream handlers (cache
+        # gates, header injection, lossy-compressor gates) read it
+        # without re-classifying. Pure function, well under 10us.
+        auth_mode = classify_auth_mode(request.headers)
+        request.state.auth_mode = auth_mode
+        logger.debug(f"[{request_id}] auth_mode_classified mode={auth_mode.value}")
 
         # Check request body size
         content_length = request.headers.get("content-length")
@@ -228,10 +1196,7 @@ class OpenAIHandlerMixin:
         stream = body.get("stream", False)
 
         # Bypass: skip ALL compression for explicit opt-out
-        _bypass = (
-            request.headers.get("x-headroom-bypass", "").lower() == "true"
-            or request.headers.get("x-headroom-mode", "").lower() == "passthrough"
-        )
+        _bypass = self._headroom_bypass_enabled(request.headers)
         if _bypass:
             logger.info(f"[{request_id}] Bypass: skipping compression (header)")
 
@@ -239,16 +1204,21 @@ class OpenAIHandlerMixin:
         if self.config.image_optimize and messages and not _bypass:
             from headroom.proxy.helpers import _get_image_compressor
 
-            compressor = _get_image_compressor()
-            if compressor and compressor.has_images(messages):
-                messages = compressor.compress(messages, provider="openai")
-                if compressor.last_result:
-                    logger.info(
-                        f"[{request_id}] Image: {compressor.last_result.technique.value} "
-                        f"({compressor.last_result.savings_percent:.0f}% saved, "
-                        f"{compressor.last_result.original_tokens} → "
-                        f"{compressor.last_result.compressed_tokens} tokens)"
-                    )
+            compressor = None
+            try:
+                compressor = _get_image_compressor()
+                if compressor and compressor.has_images(messages):
+                    messages = compressor.compress(messages, provider="openai")
+                    if compressor.last_result:
+                        logger.info(
+                            f"[{request_id}] Image: {compressor.last_result.technique.value} "
+                            f"({compressor.last_result.savings_percent:.0f}% saved, "
+                            f"{compressor.last_result.original_tokens} → "
+                            f"{compressor.last_result.compressed_tokens} tokens)"
+                        )
+            finally:
+                if compressor and hasattr(compressor, "close"):
+                    compressor.close()
 
         headers = dict(request.headers.items())
         headers.pop("host", None)
@@ -257,14 +1227,49 @@ class OpenAIHandlerMixin:
         # Cloudflare Workers forward "br, zstd" which OpenAI may honor;
         # if httpx lacks brotli support the response body is undecipherable → 502.
         headers.pop("accept-encoding", None)
-        tags = self._extract_tags(headers)
+        tags = extract_tags(headers)
+        client = classify_client(headers)
+        # PR-A5 (P5-49): strip internal x-headroom-* from upstream-bound
+        # headers AFTER `_extract_tags` reads them. Inbound bypass gating
+        # uses `request.headers.get(...)` above; memory user-id reads
+        # `request.headers` below. From this point on, `headers` is the
+        # upstream-bound copy.
+        from headroom.proxy.helpers import _strip_internal_headers, log_outbound_headers
 
-        # Memory: Get user ID when memory is enabled
+        _pre_strip_count_chat = sum(1 for k in headers if k.lower().startswith("x-headroom-"))
+        headers = _strip_internal_headers(headers)
+        log_outbound_headers(
+            forwarder="openai_chat_completions",
+            stripped_count=_pre_strip_count_chat,
+            request_id=request_id,
+        )
+
+        # Memory: Get user ID when memory is enabled. Reads `request.headers`
+        # directly because `headers` was stripped of `x-headroom-*` for the
+        # upstream-bound copy (PR-A5).
         memory_user_id: str | None = None
+        memory_request_ctx = None
         if self.memory_handler:
-            memory_user_id = headers.get(
+            memory_user_id = request.headers.get(
                 "x-headroom-user-id",
                 os.environ.get("USER", os.environ.get("USERNAME", "default")),
+            )
+            # Per-project memory routing (GH #462). Built once per request
+            # so every save/search/inject resolves to the same workspace.
+            from headroom.memory.storage_router import (
+                RequestContext as _MemRequestContext,
+            )
+            from headroom.memory.storage_router import (
+                extract_system_prompt as _extract_sys_prompt,
+            )
+
+            memory_request_ctx = _MemRequestContext(
+                headers=dict(request.headers),
+                system_prompt=_extract_sys_prompt(body),
+                base_user_id=memory_user_id,
+                project_root_override=(
+                    getattr(self.memory_handler.config, "project_root_override", "") or None
+                ),
             )
 
         # Rate limiting
@@ -291,14 +1296,27 @@ class OpenAIHandlerMixin:
                     messages=messages,
                     metadata={"cache_hit": True, "path": "/v1/chat/completions"},
                 )
-                await self.metrics.record_request(
-                    provider="openai",
-                    model=model,
-                    input_tokens=0,
-                    output_tokens=0,
-                    tokens_saved=0,  # Savings already counted when response was cached
-                    latency_ms=(time.time() - start_time) * 1000,
-                    cached=True,
+                # Response-cache hit: same pattern as the anthropic
+                # cache-hit site. ``from_response_cache=True`` is the
+                # distinct signal that the proxy served from its own
+                # semantic cache (not upstream prompt cache).
+                _cache_hit_latency = (time.time() - start_time) * 1000
+                await self._record_request_outcome(
+                    RequestOutcome(
+                        request_id=request_id,
+                        provider="openai",
+                        model=model,
+                        original_tokens=0,
+                        optimized_tokens=0,
+                        output_tokens=0,
+                        tokens_saved=0,
+                        attempted_input_tokens=0,
+                        from_response_cache=True,
+                        total_latency_ms=_cache_hit_latency,
+                        num_messages=len(messages),
+                        tags=tags,
+                        client=client,
+                    )
                 )
 
                 # Remove compression headers from cached response
@@ -336,6 +1354,48 @@ class OpenAIHandlerMixin:
         openai_prefix_tracker = self.session_tracker_store.get_or_create(
             openai_session_id, "openai"
         )
+
+        # PR-A6 (P5-50, preps P0-6): session-sticky `OpenAI-Beta` merge.
+        # Same pattern as anthropic.py — read client value, union with
+        # session-seen tokens, update tracker. WS auto-injection of
+        # `responses_websockets=2026-02-06` lives on the WS handler;
+        # chat-completions has no Headroom-required tokens today, so the
+        # merge effectively just makes the client value byte-stable
+        # across turns.
+        from headroom.proxy.helpers import (
+            get_session_beta_tracker as _get_session_beta_tracker_chat,
+        )
+        from headroom.proxy.helpers import (
+            log_beta_header_merge as _log_beta_header_merge_chat,
+        )
+
+        _client_openai_beta = headers.get("openai-beta")
+        _client_openai_beta_count = (
+            len([t for t in (_client_openai_beta or "").split(",") if t.strip()])
+            if _client_openai_beta
+            else 0
+        )
+        _sticky_openai_beta = _get_session_beta_tracker_chat().record_and_get_sticky_betas(
+            provider="openai",
+            session_id=openai_session_id,
+            client_value=_client_openai_beta,
+        )
+        _sticky_openai_beta_count = (
+            len([t for t in _sticky_openai_beta.split(",") if t.strip()])
+            if _sticky_openai_beta
+            else 0
+        )
+        if _sticky_openai_beta and _sticky_openai_beta != (_client_openai_beta or ""):
+            headers["openai-beta"] = _sticky_openai_beta
+        _log_beta_header_merge_chat(
+            provider="openai",
+            session_id=openai_session_id,
+            client_betas_count=_client_openai_beta_count,
+            sticky_betas_count=_sticky_openai_beta_count,
+            headroom_added=[],
+            request_id=request_id,
+        )
+
         openai_frozen_count = openai_prefix_tracker.get_frozen_message_count()
         if is_cache_mode(self.config.mode):
             openai_frozen_count = self._strict_previous_turn_frozen_count(
@@ -345,10 +1405,28 @@ class OpenAIHandlerMixin:
 
         _compression_failed = False
         original_messages = messages  # Preserve for 400-retry fallback
-        _license_ok = self.usage_reporter.should_compress if self.usage_reporter else True
-        if self.config.optimize and messages and not _bypass and _license_ok:
+        _decision = CompressionDecision.decide(
+            headers=request.headers,
+            config=self.config,
+            usage_reporter=self.usage_reporter,
+            messages=messages,
+        )
+        _decision.apply_to_tags(tags)
+        if not _decision.should_compress:
+            logger.info(
+                f"[{request_id}] Compression skipped: reason={_decision.passthrough_reason}"
+            )
+        if _decision.should_compress:
             try:
                 context_limit = self.openai_provider.get_context_limit(model)
+
+                # F2.1 c5/5: per-request CompressionPolicy. Hoisted out of
+                # the is_token_mode branch so the else (non-token) branch
+                # below can pass it through too. See the equivalent block
+                # in handlers/anthropic.py.
+                from headroom.transforms.compression_policy import resolve_policy
+
+                compression_policy = resolve_policy(getattr(request.state, "auth_mode", None))
 
                 if is_token_mode(self.config.mode):
                     comp_cache = self._get_compression_cache(openai_session_id)
@@ -359,16 +1437,15 @@ class OpenAIHandlerMixin:
                     # Re-freeze boundary
                     openai_frozen_count = comp_cache.compute_frozen_count(messages)
 
-                    result = await asyncio.wait_for(
-                        asyncio.to_thread(
-                            lambda: self.openai_pipeline.apply(
-                                messages=working_messages,
-                                model=model,
-                                model_limit=context_limit,
-                                context=extract_user_query(working_messages),
-                                frozen_message_count=openai_frozen_count,
-                                biases=_hook_biases,
-                            )
+                    result = await self._run_compression_in_executor(
+                        lambda: self.openai_pipeline.apply(
+                            messages=working_messages,
+                            model=model,
+                            model_limit=context_limit,
+                            context=extract_user_query(working_messages),
+                            frozen_message_count=openai_frozen_count,
+                            biases=_hook_biases,
+                            compression_policy=compression_policy,
                         ),
                         timeout=COMPRESSION_TIMEOUT_SECONDS,
                     )
@@ -384,16 +1461,15 @@ class OpenAIHandlerMixin:
                     # so tokens_saved captures both Zone 1 + Zone 2 savings.
                     optimized_tokens = result.tokens_after
                 else:
-                    result = await asyncio.wait_for(
-                        asyncio.to_thread(
-                            lambda: self.openai_pipeline.apply(
-                                messages=messages,
-                                model=model,
-                                model_limit=context_limit,
-                                context=extract_user_query(messages),
-                                frozen_message_count=openai_frozen_count,
-                                biases=_hook_biases,
-                            )
+                    result = await self._run_compression_in_executor(
+                        lambda: self.openai_pipeline.apply(
+                            messages=messages,
+                            model=model,
+                            model_limit=context_limit,
+                            context=extract_user_query(messages),
+                            frozen_message_count=openai_frozen_count,
+                            biases=_hook_biases,
+                            compression_policy=compression_policy,
                         ),
                         timeout=COMPRESSION_TIMEOUT_SECONDS,
                     )
@@ -484,6 +1560,12 @@ class OpenAIHandlerMixin:
                 logger.debug(f"[{request_id}] post_compress hook error: {e}")
 
         # CCR Tool Injection: Inject retrieval tool if compression occurred
+        # OR if this session has previously done CCR (PR-B7 sticky-on).
+        # See `headroom/proxy/handlers/anthropic.py` and PR-B7 plan
+        # `REALIGNMENT/04-phase-B-live-zone.md` for the rationale: once a
+        # session has done CCR, the `headroom_retrieve` tool stays
+        # registered for every subsequent turn so the prompt cache
+        # anchored on the previous turn's tool list never busts.
         tools = body.get("tools")
         _original_tools = tools  # Preserve for diagnostic / future retry
         if (
@@ -491,24 +1573,30 @@ class OpenAIHandlerMixin:
         ) and not _bypass:
             injector = CCRToolInjector(
                 provider="openai",
-                inject_tool=self.config.ccr_inject_tool,
+                inject_tool=False,  # routed through sticky helper below
                 inject_system_instructions=self.config.ccr_inject_system_instructions,
             )
-            optimized_messages, tools, was_injected = injector.process_request(
-                optimized_messages, tools
-            )
+            injector.scan_for_markers(optimized_messages)
+            if self.config.ccr_inject_system_instructions and injector.has_compressed_content:
+                optimized_messages = injector.inject_into_system_message(optimized_messages)
 
-            if injector.has_compressed_content:
-                if was_injected:
+            if self.config.ccr_inject_tool:
+                from headroom.proxy.helpers import apply_session_sticky_ccr_tool
+
+                tools, ccr_tool_injected = apply_session_sticky_ccr_tool(
+                    provider="openai",
+                    session_id=openai_session_id,
+                    request_id=request_id,
+                    existing_tools=tools,
+                    has_compressed_content_this_turn=injector.has_compressed_content,
+                )
+                if ccr_tool_injected:
                     logger.debug(
-                        f"[{request_id}] CCR: Injected retrieval tool for hashes: {injector.detected_hashes}"
-                    )
-                else:
-                    logger.debug(
-                        f"[{request_id}] CCR: Tool already present (MCP?), skipped injection for hashes: {injector.detected_hashes}"
+                        f"[{request_id}] CCR: tool registered (session={openai_session_id}, "
+                        f"compressed_this_turn={injector.has_compressed_content}, "
+                        f"hashes_seen={len(injector.detected_hashes)})"
                     )
 
-        # Query Echo: disabled — hurts prefix caching in long conversations.
         if is_cache_mode(self.config.mode):
             optimized_messages, restored_count = self._restore_frozen_prefix(
                 original_client_messages,
@@ -521,34 +1609,87 @@ class OpenAIHandlerMixin:
                     "to preserve cache stability (openai)"
                 )
 
-        # Memory: inject context and tools for OpenAI requests
+        # Memory: inject context and tools for OpenAI requests.
+        #
+        # PR-A3 follow-up to A2: memory context now routes exclusively to
+        # the live-zone tail (latest user message), never via a system-level
+        # prepend. The cache hot zone (system messages) is sacrosanct —
+        # invariant I2. See REALIGNMENT/03-phase-A-lockdown.md PR-A3.
         memory_context_injected = False
         memory_tools_injected = False
         if self.memory_handler and memory_user_id:
             try:
-                # Inject memory context (search similar memories, add as system message)
                 if self.memory_handler.config.inject_context:
                     memory_context = await self.memory_handler.search_and_format_context(
-                        memory_user_id, optimized_messages
+                        memory_user_id,
+                        optimized_messages,
+                        request_context=memory_request_ctx,
                     )
                     if memory_context:
-                        # Prepend as system message for OpenAI format
-                        optimized_messages = [
-                            {"role": "system", "content": memory_context},
-                            *optimized_messages,
-                        ]
-                        memory_context_injected = True
-                        logger.info(
-                            f"[{request_id}] Memory: Injected {len(memory_context)} chars "
-                            f"of context for user {memory_user_id}"
+                        from headroom.proxy.helpers import (
+                            append_text_to_latest_user_chat_message,
+                            get_memory_injection_mode,
+                            log_memory_injection,
                         )
 
-                # Inject memory tools
-                if self.memory_handler.config.inject_tools:
-                    tools, mem_tools_injected = self.memory_handler.inject_tools(tools, "openai")
-                    if mem_tools_injected:
-                        memory_tools_injected = True
-                        logger.info(f"[{request_id}] Memory: Injected memory tools (openai)")
+                        injection_mode = get_memory_injection_mode()
+                        if injection_mode == "disabled":
+                            log_memory_injection(
+                                request_id=request_id,
+                                session_id=None,
+                                decision="skipped_disabled",
+                                bytes_injected=0,
+                                query=None,
+                            )
+                        else:
+                            new_messages, bytes_appended = append_text_to_latest_user_chat_message(
+                                optimized_messages, memory_context
+                            )
+                            if bytes_appended > 0:
+                                optimized_messages = new_messages
+                                memory_context_injected = True
+                                log_memory_injection(
+                                    request_id=request_id,
+                                    session_id=None,
+                                    decision="injected_live_zone_tail_chat",
+                                    bytes_injected=bytes_appended,
+                                    query=None,
+                                )
+                                logger.info(
+                                    f"[{request_id}] Memory: Injected {bytes_appended} chars "
+                                    f"into latest user message tail for user {memory_user_id}"
+                                )
+                            else:
+                                log_memory_injection(
+                                    request_id=request_id,
+                                    session_id=None,
+                                    decision="no_eligible_user_message",
+                                    bytes_injected=0,
+                                    query=None,
+                                )
+
+                # Inject memory tools — PR-A7 (P0-6) routes through
+                # `apply_session_sticky_memory_tools` so byte-stable across turns.
+                from headroom.proxy.helpers import (
+                    apply_session_sticky_memory_tools as _apply_sticky_mem_tools,
+                )
+
+                memory_tool_defs = (
+                    self.memory_handler.compute_memory_tool_definitions("openai")
+                    if self.memory_handler.config.inject_tools
+                    else []
+                )
+                tools, mem_tools_injected = _apply_sticky_mem_tools(
+                    provider="openai",
+                    session_id=openai_session_id,
+                    request_id=request_id,
+                    existing_tools=tools,
+                    memory_tools_to_inject=memory_tool_defs,
+                    inject_this_turn=bool(self.memory_handler.config.inject_tools),
+                )
+                if mem_tools_injected:
+                    memory_tools_injected = True
+                    logger.info(f"[{request_id}] Memory: Injected memory tools (openai)")
             except Exception as e:
                 logger.warning(f"[{request_id}] Memory injection failed: {e}")
 
@@ -625,6 +1766,7 @@ class OpenAIHandlerMixin:
                         tags,
                         optimization_latency,
                         pipeline_timing=pipeline_timing,
+                        waste_signals=waste_signals_dict,
                     )
                 else:
                     # Non-streaming: use send_openai_message() → JSON
@@ -666,22 +1808,41 @@ class OpenAIHandlerMixin:
                             content=backend_response.body,
                         )
 
-                    # Track metrics
+                    # OpenAI Chat via backend (LiteLLM/AnyLLM), non-
+                    # streaming. No per-message live-zone tracking yet
+                    # — use full pre-comp request size as the attempted
+                    # denominator so this provider's contribution to
+                    # active_savings is its whole-request ratio.
+                    # Cache extraction from the backend response body
+                    # is not wired here yet (follow-up); funnel passes
+                    # zeros for cache fields, matching pre-refactor
+                    # behaviour.
                     total_latency = (time.time() - start_time) * 1000
                     usage = backend_response.body.get("usage", {})
                     output_tokens = usage.get("completion_tokens", 0)
                     total_input_tokens = usage.get("prompt_tokens", optimized_tokens)
-
-                    await self.metrics.record_request(
-                        provider=self.anthropic_backend.name,
-                        model=model,
-                        input_tokens=total_input_tokens,
-                        output_tokens=output_tokens,
-                        tokens_saved=tokens_saved,
-                        latency_ms=total_latency,
-                        cached=False,
-                        overhead_ms=optimization_latency,
-                        pipeline_timing=pipeline_timing,
+                    await self._record_request_outcome(
+                        RequestOutcome(
+                            request_id=request_id,
+                            provider=self.anthropic_backend.name,
+                            model=model,
+                            original_tokens=original_tokens,
+                            optimized_tokens=total_input_tokens,
+                            output_tokens=output_tokens,
+                            tokens_saved=tokens_saved,
+                            attempted_input_tokens=total_input_tokens + tokens_saved,
+                            total_latency_ms=total_latency,
+                            overhead_ms=optimization_latency,
+                            pipeline_timing=pipeline_timing,
+                            waste_signals=waste_signals_dict,
+                            transforms_applied=tuple(transforms_applied),
+                            num_messages=len(body.get("messages", [])),
+                            tags=tags or {},
+                            request_messages=body.get("messages")
+                            if getattr(self.config, "log_full_messages", False)
+                            else None,
+                            client=client,
+                        )
                     )
 
                     if tokens_saved > 0:
@@ -875,9 +2036,13 @@ class OpenAIHandlerMixin:
                     )
 
                 # Update prefix cache tracker for next turn
+                cache_write_tokens = _infer_openai_cache_write_tokens(
+                    total_input_tokens,
+                    cache_read_tokens,
+                )
                 openai_prefix_tracker.update_from_response(
                     cache_read_tokens=cache_read_tokens,
-                    cache_write_tokens=0,  # OpenAI doesn't report write tokens
+                    cache_write_tokens=cache_write_tokens,
                     messages=optimized_messages,
                 )
 
@@ -890,6 +2055,7 @@ class OpenAIHandlerMixin:
                         tokens_saved,
                         optimized_tokens,
                         cache_read_tokens=cache_read_tokens,
+                        cache_write_tokens=cache_write_tokens,
                         uncached_tokens=uncached_input_tokens,
                     )
 
@@ -905,7 +2071,10 @@ class OpenAIHandlerMixin:
                 ):
                     try:
                         tool_results = await self.memory_handler.handle_memory_tool_calls(
-                            resp_json, memory_user_id, "openai"
+                            resp_json,
+                            memory_user_id,
+                            "openai",
+                            request_context=memory_request_ctx,
                         )
                         if tool_results:
                             # Build continuation: original messages + assistant tool_calls + tool results
@@ -950,18 +2119,47 @@ class OpenAIHandlerMixin:
 
                 get_codex_rate_limit_state().update_from_headers(dict(response.headers))
 
-                await self.metrics.record_request(
-                    provider="openai",
-                    model=model,
-                    input_tokens=total_input_tokens,
-                    output_tokens=output_tokens,
-                    tokens_saved=tokens_saved,
-                    latency_ms=total_latency,
-                    overhead_ms=optimization_latency,
-                    pipeline_timing=pipeline_timing,
-                    waste_signals=waste_signals_dict,
-                    cache_read_tokens=cache_read_tokens,
-                    uncached_input_tokens=uncached_input_tokens,
+                # Tag the metric/log with auth_mode + endpoint so the
+                # dashboard can break down by client class (PAYG vs
+                # subscription vs OAuth) without re-classifying.
+                _auth_mode_chat = getattr(request.state, "auth_mode", None)
+                _chat_log_tags = {
+                    **(tags or {}),
+                    "auth_mode": _auth_mode_chat.value if _auth_mode_chat else "payg",
+                    "endpoint": "chat_completions",
+                }
+
+                # OpenAI Chat direct (non-backend) non-streaming.
+                # Fallback denominator: full pre-comp size — see
+                # equivalent note at the backend-routed sibling.
+                from headroom.proxy.helpers import compute_turn_id
+
+                await self._record_request_outcome(
+                    RequestOutcome(
+                        request_id=request_id,
+                        provider="openai",
+                        model=model,
+                        original_tokens=original_tokens,
+                        optimized_tokens=total_input_tokens,
+                        output_tokens=output_tokens,
+                        tokens_saved=tokens_saved,
+                        attempted_input_tokens=total_input_tokens + tokens_saved,
+                        cache_read_tokens=cache_read_tokens,
+                        cache_write_tokens=cache_write_tokens,
+                        uncached_input_tokens=uncached_input_tokens,
+                        total_latency_ms=total_latency,
+                        overhead_ms=optimization_latency,
+                        pipeline_timing=pipeline_timing,
+                        waste_signals=waste_signals_dict,
+                        transforms_applied=tuple(transforms_applied),
+                        num_messages=len(body.get("messages", [])),
+                        tags=_chat_log_tags,
+                        turn_id=compute_turn_id(model, body.get("system"), body.get("messages")),
+                        request_messages=body.get("messages")
+                        if getattr(self.config, "log_full_messages", False)
+                        else None,
+                        client=client,
+                    )
                 )
 
                 if tokens_saved > 0:
@@ -1025,19 +2223,22 @@ class OpenAIHandlerMixin:
         from fastapi.responses import JSONResponse, Response
 
         from headroom.proxy.helpers import (
-            COMPRESSION_TIMEOUT_SECONDS,
             MAX_REQUEST_BODY_SIZE,
             _read_request_json,
-        )
-        from headroom.proxy.responses_converter import (
-            messages_to_responses_items,
-            responses_items_to_messages,
         )
         from headroom.tokenizers import get_tokenizer
         from headroom.utils import extract_user_query
 
         start_time = time.time()
         request_id = await self._next_request_id()
+
+        # Phase F PR-F1: classify auth mode at request entry. The result
+        # is stored on `request.state` so downstream handlers (cache
+        # gates, header injection, lossy-compressor gates) read it
+        # without re-classifying. Pure function, well under 10us.
+        auth_mode = classify_auth_mode(request.headers)
+        request.state.auth_mode = auth_mode
+        logger.debug(f"[{request_id}] auth_mode_classified mode={auth_mode.value}")
 
         # Check request body size
         content_length = request.headers.get("content-length")
@@ -1070,29 +2271,42 @@ class OpenAIHandlerMixin:
 
         model = body.get("model", "unknown")
         stream = body.get("stream", False)
+        _bypass = self._headroom_bypass_enabled(request.headers)
+        if _bypass:
+            logger.info(
+                "[%s] Responses passthrough reason=bypass_header mutation=disabled",
+                request_id,
+            )
 
-        # Convert Responses API input to messages format for optimization.
-        # The Responses API uses a different item model (function_call,
-        # function_call_output, reasoning as top-level items) — we convert to
-        # Chat Completions messages for the pipeline, then convert back.
+        from headroom.proxy.helpers import capture_codex_wire_debug
 
+        capture_codex_wire_debug(
+            "http_inbound_request",
+            request_id=request_id,
+            transport="http",
+            direction="client_to_headroom",
+            method=request.method,
+            url=str(request.url),
+            headers=dict(request.headers.items()),
+            body=body,
+            metadata={"path": request.url.path, "stream": stream},
+        )
+
+        # /v1/responses uses provider-specific CompressionUnit extraction
+        # below, then routes mutable text through ContentRouter. The
+        # standalone Rust proxy has native item-aware handling, but the
+        # Python CLI runtime does not run that proxy today. We synthesise a
+        # minimal `messages` list purely for downstream memory injection and
+        # telemetry; list-typed `input` is consulted directly by the unit
+        # extraction helpers.
         input_data = body.get("input", "")
         instructions = body.get("instructions")
-        previous_response_id = body.get("previous_response_id")
 
         messages: list[dict[str, Any]] = []
-        original_items: list[dict[str, Any]] | None = None
-        preserved_indices: list[int] = []
-
         if instructions:
             messages.append({"role": "system", "content": instructions})
-
         if isinstance(input_data, str):
             messages.append({"role": "user", "content": input_data})
-        elif isinstance(input_data, list):
-            original_items = input_data
-            converted, preserved_indices = responses_items_to_messages(input_data)
-            messages.extend(converted)
 
         headers = dict(request.headers.items())
         headers.pop("host", None)
@@ -1101,14 +2315,83 @@ class OpenAIHandlerMixin:
         # Cloudflare Workers forward "br, zstd" which OpenAI may honor;
         # if httpx lacks brotli support the response body is undecipherable → 502.
         headers.pop("accept-encoding", None)
-        tags = self._extract_tags(headers)
+        tags = extract_tags(headers)
+        client = classify_client(headers)
+        # PR-A5 (P5-49): strip internal x-headroom-* from upstream-bound
+        # headers AFTER `_extract_tags` reads them. Memory user-id reads
+        # `request.headers` below.
+        from headroom.proxy.helpers import _strip_internal_headers, log_outbound_headers
 
-        # Memory: Get user ID when memory is enabled
+        _pre_strip_count_resp = sum(1 for k in headers if k.lower().startswith("x-headroom-"))
+        headers = _strip_internal_headers(headers)
+        log_outbound_headers(
+            forwarder="openai_responses",
+            stripped_count=_pre_strip_count_resp,
+            request_id=request_id,
+        )
+
+        # PR-A6 (P5-50, preps P0-6): session-sticky `OpenAI-Beta` merge
+        # for /v1/responses. Compute a session_id off the same store the
+        # chat handler uses so multi-endpoint clients within one
+        # conversation share the sticky-token set.
+        _responses_session_id = self.session_tracker_store.compute_session_id(
+            request, model, messages
+        )
+        from headroom.proxy.helpers import (
+            get_session_beta_tracker as _get_session_beta_tracker_resp,
+        )
+        from headroom.proxy.helpers import (
+            log_beta_header_merge as _log_beta_header_merge_resp,
+        )
+
+        _client_resp_beta = headers.get("openai-beta")
+        _client_resp_beta_count = (
+            len([t for t in (_client_resp_beta or "").split(",") if t.strip()])
+            if _client_resp_beta
+            else 0
+        )
+        _sticky_resp_beta = _get_session_beta_tracker_resp().record_and_get_sticky_betas(
+            provider="openai",
+            session_id=_responses_session_id,
+            client_value=_client_resp_beta,
+        )
+        _sticky_resp_beta_count = (
+            len([t for t in _sticky_resp_beta.split(",") if t.strip()]) if _sticky_resp_beta else 0
+        )
+        if _sticky_resp_beta and _sticky_resp_beta != (_client_resp_beta or ""):
+            headers["openai-beta"] = _sticky_resp_beta
+        _log_beta_header_merge_resp(
+            provider="openai",
+            session_id=_responses_session_id,
+            client_betas_count=_client_resp_beta_count,
+            sticky_betas_count=_sticky_resp_beta_count,
+            headroom_added=[],
+            request_id=request_id,
+        )
+
+        # Memory: Get user ID when memory is enabled. Reads `request.headers`
+        # directly because `headers` was stripped of `x-headroom-*` (PR-A5).
         memory_user_id: str | None = None
+        memory_request_ctx = None
         if self.memory_handler:
-            memory_user_id = headers.get(
+            memory_user_id = request.headers.get(
                 "x-headroom-user-id",
                 os.environ.get("USER", os.environ.get("USERNAME", "default")),
+            )
+            from headroom.memory.storage_router import (
+                RequestContext as _MemRequestContext,
+            )
+            from headroom.memory.storage_router import (
+                extract_system_prompt as _extract_sys_prompt,
+            )
+
+            memory_request_ctx = _MemRequestContext(
+                headers=dict(request.headers),
+                system_prompt=_extract_sys_prompt(body),
+                base_user_id=memory_user_id,
+                project_root_override=(
+                    getattr(self.memory_handler.config, "project_root_override", "") or None
+                ),
             )
 
         # Rate limiting
@@ -1126,79 +2409,34 @@ class OpenAIHandlerMixin:
         tokenizer = get_tokenizer(model)
         original_tokens = tokenizer.count_messages(messages)
 
-        # Optimize: convert items → compress → convert back
-        tokens_saved = 0
-        transforms_applied: list[str] = []
+        # Defaults below feed downstream telemetry and memory injection.
+        # If optimization remains enabled, the Responses payload is compressed
+        # later through `_compress_openai_responses_payload`.
         optimized_messages = messages
         optimized_tokens = original_tokens
-
-        _bypass = (
-            request.headers.get("x-headroom-bypass", "").lower() == "true"
-            or request.headers.get("x-headroom-mode", "").lower() == "passthrough"
-        )
-        _should_compress = (
-            self.config.optimize
-            and original_items is not None
-            and not previous_response_id
-            and not _bypass
-            and len(messages) > 1
-        )
-        _license_ok = self.usage_reporter.should_compress if self.usage_reporter else True
-
-        if _should_compress and _license_ok:
-            try:
-                context_limit = self.openai_provider.get_context_limit(model)
-                result = await asyncio.wait_for(
-                    asyncio.to_thread(
-                        lambda: self.openai_pipeline.apply(
-                            messages=messages,
-                            model=model,
-                            model_limit=context_limit,
-                            context=extract_user_query(messages),
-                        )
-                    ),
-                    timeout=COMPRESSION_TIMEOUT_SECONDS,
-                )
-                if result.messages != messages:
-                    optimized_messages = result.messages
-                    transforms_applied = result.transforms_applied
-                    original_tokens = result.tokens_before
-                    optimized_tokens = result.tokens_after
-            except Exception as e:
-                logger.warning(f"[{request_id}] Responses API optimization failed: {e}")
-
-        # Guard: if "optimization" inflated tokens, revert to originals
-        if optimized_tokens > original_tokens:
-            logger.warning(
-                f"[{request_id}] Optimization inflated tokens "
-                f"({original_tokens} -> {optimized_tokens}), reverting to original messages"
-            )
-            optimized_messages = messages
-            optimized_tokens = original_tokens
-            transforms_applied = []
-
-        tokens_saved = original_tokens - optimized_tokens
+        tokens_saved = 0
+        # Eligible-only denominator for the active compression ratio.
+        # Populated by `_compress_openai_responses_payload` if it runs;
+        # stays 0 on bypass / passthrough paths so we don't fabricate a
+        # denominator we haven't earned.
+        attempted_input_tokens = 0
+        transforms_applied: list[str] = []
         optimization_latency = (time.time() - start_time) * 1000
 
-        # Convert compressed messages back to Responses API items
-        if optimized_messages is not messages and original_items is not None:
-            opt_msgs = optimized_messages
-            # Strip system message (instructions) — it's separate in Responses API
-            if instructions and opt_msgs and opt_msgs[0].get("role") == "system":
-                body["instructions"] = opt_msgs[0]["content"]
-                opt_msgs = opt_msgs[1:]
-
-            body["input"] = messages_to_responses_items(opt_msgs, original_items, preserved_indices)
-
         # Memory: inject context and tools for Responses API requests
-        if self.memory_handler and memory_user_id:
+        if self.memory_handler and memory_user_id and not _bypass:
             try:
-                # Inject memory context into instructions (Responses API system prompt)
+                # Memory context now routes exclusively to the live-zone tail
+                # (latest non-frozen user item). Instructions are part of the
+                # cache hot zone and must never be mutated — invariant I2.
+                # See REALIGNMENT/03-phase-A-lockdown.md PR-A2.
                 if self.memory_handler.config.inject_context:
                     try:
                         memory_context = await asyncio.wait_for(
                             self.memory_handler.search_and_format_context(
-                                memory_user_id, optimized_messages
+                                memory_user_id,
+                                optimized_messages,
+                                request_context=memory_request_ctx,
                             ),
                             timeout=RESPONSES_CONTEXT_SEARCH_TIMEOUT_SECONDS,
                         )
@@ -1209,44 +2447,122 @@ class OpenAIHandlerMixin:
                             f"{RESPONSES_CONTEXT_SEARCH_TIMEOUT_SECONDS:.1f}s; continuing without it"
                         )
                     if memory_context:
-                        existing_instructions = body.get("instructions") or ""
-                        if existing_instructions:
-                            body["instructions"] = f"{existing_instructions}\n\n{memory_context}"
-                        else:
-                            body["instructions"] = memory_context
-                        logger.info(
-                            f"[{request_id}] Memory: Injected {len(memory_context)} chars "
-                            f"of context into instructions for user {memory_user_id}"
+                        from headroom.proxy.helpers import (
+                            append_text_to_latest_user_input_item,
+                            get_memory_injection_mode,
+                            log_memory_injection,
                         )
 
-                # Inject memory tools (Responses API format)
-                if self.memory_handler.config.inject_tools:
-                    resp_tools = body.get("tools") or []
-                    resp_tools, mem_tools_injected = self.memory_handler.inject_tools(
-                        resp_tools, "openai"
-                    )
-                    if mem_tools_injected:
-                        # Convert Chat Completions format to Responses API format
-                        converted_tools = []
-                        for t in resp_tools:
-                            if t.get("type") == "function" and "function" in t:
-                                fn = t["function"]
-                                converted_tools.append(
-                                    {
-                                        "type": "function",
-                                        "name": fn.get("name"),
-                                        "description": fn.get("description", ""),
-                                        "parameters": fn.get("parameters", {}),
-                                    }
+                        injection_mode = get_memory_injection_mode()
+                        user_query = extract_user_query(optimized_messages) or ""
+                        if injection_mode == "disabled":
+                            log_memory_injection(
+                                request_id=request_id,
+                                session_id=None,
+                                decision="skipped_disabled",
+                                bytes_injected=0,
+                                query=user_query,
+                            )
+                        else:
+                            # Route into body["input"] (the canonical Responses API
+                            # field) targeting the latest user item's first text
+                            # block. body["instructions"] (cache hot zone) is left
+                            # untouched.
+                            current_input = body.get("input")
+                            if isinstance(current_input, str):
+                                # String input: append to it. The string IS the
+                                # latest user content; appending here is the
+                                # equivalent of the live-zone tail.
+                                body["input"] = (
+                                    current_input + "\n\n" + memory_context
+                                    if current_input
+                                    else memory_context
                                 )
+                                log_memory_injection(
+                                    request_id=request_id,
+                                    session_id=None,
+                                    decision="injected_live_zone_tail_string",
+                                    bytes_injected=len(memory_context),
+                                    query=user_query,
+                                )
+                            elif isinstance(current_input, list):
+                                new_input, bytes_appended = append_text_to_latest_user_input_item(
+                                    current_input, memory_context
+                                )
+                                if bytes_appended > 0:
+                                    body["input"] = new_input
+                                    log_memory_injection(
+                                        request_id=request_id,
+                                        session_id=None,
+                                        decision="injected_live_zone_tail",
+                                        bytes_injected=bytes_appended,
+                                        query=user_query,
+                                    )
+                                else:
+                                    log_memory_injection(
+                                        request_id=request_id,
+                                        session_id=None,
+                                        decision="no_eligible_user_item",
+                                        bytes_injected=0,
+                                        query=user_query,
+                                    )
                             else:
-                                converted_tools.append(t)
-                        body["tools"] = converted_tools
-                        logger.info(
-                            f"[{request_id}] Memory: Injected memory tools (openai/responses)"
+                                log_memory_injection(
+                                    request_id=request_id,
+                                    session_id=None,
+                                    decision="no_input_field",
+                                    bytes_injected=0,
+                                    query=user_query,
+                                )
+
+                # Inject memory tools (Responses API format) — PR-A7 (P0-6).
+                # Pre-convert the Chat-Completions schema to Responses API
+                # format BEFORE handing to the sticky tracker so the
+                # canonical bytes pinned in turn 1 already reflect the
+                # exact bytes that will hit the wire.
+                from headroom.proxy.helpers import (
+                    apply_session_sticky_memory_tools as _apply_sticky_mem_tools_resp,
+                )
+
+                memory_tool_defs_chat = (
+                    self.memory_handler.compute_memory_tool_definitions("openai")
+                    if self.memory_handler.config.inject_tools
+                    else []
+                )
+                memory_tool_defs_responses: list[dict[str, Any]] = []
+                for t in memory_tool_defs_chat:
+                    if t.get("type") == "function" and "function" in t:
+                        fn = t["function"]
+                        memory_tool_defs_responses.append(
+                            {
+                                "type": "function",
+                                "name": fn.get("name"),
+                                "description": fn.get("description", ""),
+                                "parameters": fn.get("parameters", {}),
+                            }
                         )
+                    else:
+                        memory_tool_defs_responses.append(t)
+
+                resp_tools = body.get("tools") or []
+                resp_tools, mem_tools_injected = _apply_sticky_mem_tools_resp(
+                    provider="openai",
+                    session_id=_responses_session_id,
+                    request_id=request_id,
+                    existing_tools=resp_tools,
+                    memory_tools_to_inject=memory_tool_defs_responses,
+                    inject_this_turn=bool(self.memory_handler.config.inject_tools),
+                )
+                if mem_tools_injected:
+                    body["tools"] = resp_tools
+                    logger.info(f"[{request_id}] Memory: Injected memory tools (openai/responses)")
             except Exception as e:
                 logger.warning(f"[{request_id}] Memory injection failed (responses): {e}")
+        elif self.memory_handler and memory_user_id and _bypass:
+            logger.info(
+                "[%s] Responses memory passthrough reason=bypass_header",
+                request_id,
+            )
 
         # /v1/responses is OpenAI-specific (Codex) — always routes direct.
         # LiteLLM/AnyLLM backends use /v1/chat/completions or /v1/messages.
@@ -1265,6 +2581,79 @@ class OpenAIHandlerMixin:
         else:
             url = build_copilot_upstream_url(self.OPENAI_API_URL, "/v1/responses")
 
+        # The standalone Rust proxy has native /v1/responses item handling,
+        # but the default CLI runtime is this Python proxy. Compress the
+        # Python runtime path here by extracting mutable Responses text into
+        # CompressionUnits and routing them through ContentRouter. Policy
+        # gating already happened upstream (auth_mode classify,
+        # CompressionPolicy resolve at request entry).
+        if self.config.optimize and not _bypass:
+            try:
+                (
+                    body,
+                    _modified,
+                    _tokens_saved,
+                    _transforms,
+                    _reason,
+                    _bytes_before,
+                    _bytes_after,
+                    _attempted_tokens,
+                    _compression_timing,
+                ) = await self._compress_openai_responses_payload_in_executor(
+                    body,
+                    model=model,
+                    request_id=request_id,
+                )
+                attempted_input_tokens = int(_attempted_tokens)
+                if _modified:
+                    tokens_saved = int(_tokens_saved)
+                    optimized_tokens = max(0, original_tokens - tokens_saved)
+                    transforms_applied = [*_transforms, *list(transforms_applied)]
+                    logger.info(
+                        "[%s] /v1/responses compressed %d→%d bytes "
+                        "(%d tokens saved, auth_mode=%s, transforms=%s)",
+                        request_id,
+                        _bytes_before,
+                        _bytes_after,
+                        tokens_saved,
+                        auth_mode.value,
+                        transforms_applied,
+                    )
+                else:
+                    logger.info(
+                        "[%s] /v1/responses compression passthrough "
+                        "reason=%s bytes=%d auth_mode=%s model=%s",
+                        request_id,
+                        _reason or "no_compression",
+                        _bytes_before,
+                        auth_mode.value,
+                        model or "unknown",
+                    )
+            except Exception as _e:
+                logger.warning(
+                    f"[{request_id}] /v1/responses compression failed; "
+                    f"forwarding original body: {type(_e).__name__}: {_e}"
+                )
+
+        capture_codex_wire_debug(
+            "http_upstream_request",
+            request_id=request_id,
+            transport="http",
+            direction="headroom_to_upstream",
+            method="POST",
+            url=url,
+            headers=headers,
+            body=body,
+            metadata={
+                "path": request.url.path,
+                "stream": stream,
+                "auth_mode": auth_mode.value,
+                "is_chatgpt_auth": is_chatgpt_auth,
+                "tokens_saved": tokens_saved,
+                "transforms_applied": transforms_applied,
+            },
+        )
+
         try:
             if stream:
                 # Streaming for Responses API uses semantic events
@@ -1282,19 +2671,56 @@ class OpenAIHandlerMixin:
                     tags,
                     optimization_latency,
                     memory_user_id=memory_user_id,
+                    memory_request_ctx=memory_request_ctx,
                 )
             else:
                 headers = await apply_copilot_api_auth(headers, url=url)
                 response = await self._retry_request("POST", url, headers, body)
+                _response_body_for_debug: Any = None
+                _response_raw_for_debug: str | None = None
+                try:
+                    _response_body_for_debug = response.json()
+                except Exception:
+                    try:
+                        _response_raw_for_debug = response.text[:200_000]
+                    except Exception:
+                        _response_raw_for_debug = None
+                capture_codex_wire_debug(
+                    "http_upstream_response",
+                    request_id=request_id,
+                    transport="http",
+                    direction="upstream_to_headroom",
+                    method="POST",
+                    url=url,
+                    headers=dict(response.headers),
+                    body=_response_body_for_debug,
+                    raw_text=_response_raw_for_debug,
+                    status_code=response.status_code,
+                    metadata={"stream": stream, "auth_mode": auth_mode.value},
+                )
                 total_latency = (time.time() - start_time) * 1000
 
                 total_input_tokens = original_tokens  # fallback
                 output_tokens = 0
+                cache_read_tokens = 0
                 try:
                     resp_json = response.json()
                     usage = resp_json.get("usage", {})
-                    total_input_tokens = usage.get("input_tokens", original_tokens)
-                    output_tokens = usage.get("output_tokens", 0)
+
+                    def _usage_int(value: Any, default: int = 0) -> int:
+                        try:
+                            return max(int(value), 0)
+                        except (TypeError, ValueError):
+                            return default
+
+                    total_input_tokens = _usage_int(
+                        usage.get("input_tokens"),
+                        original_tokens,
+                    )
+                    output_tokens = _usage_int(usage.get("output_tokens"))
+                    details = usage.get("input_tokens_details")
+                    if isinstance(details, dict):
+                        cache_read_tokens = _usage_int(details.get("cached_tokens"))
                 except (KeyError, TypeError, AttributeError) as e:
                     logger.debug(
                         f"[{request_id}] Failed to extract cached tokens from OpenAI passthrough response: {e}"
@@ -1376,16 +2802,71 @@ class OpenAIHandlerMixin:
                         )
 
                 if self.cost_tracker:
-                    self.cost_tracker.record_tokens(model, tokens_saved, total_input_tokens)
+                    cache_write_tokens = _infer_openai_cache_write_tokens(
+                        total_input_tokens,
+                        cache_read_tokens,
+                    )
+                    uncached_input_tokens = max(0, total_input_tokens - cache_read_tokens)
+                    self.cost_tracker.record_tokens(
+                        model,
+                        tokens_saved,
+                        total_input_tokens,
+                        cache_read_tokens=cache_read_tokens,
+                        cache_write_tokens=cache_write_tokens,
+                        uncached_tokens=uncached_input_tokens,
+                    )
+                else:
+                    cache_write_tokens = _infer_openai_cache_write_tokens(
+                        total_input_tokens,
+                        cache_read_tokens,
+                    )
+                    uncached_input_tokens = max(0, total_input_tokens - cache_read_tokens)
 
-                await self.metrics.record_request(
-                    provider="openai",
-                    model=model,
-                    input_tokens=total_input_tokens,
-                    output_tokens=output_tokens,
-                    tokens_saved=tokens_saved,
-                    latency_ms=total_latency,
-                    overhead_ms=optimization_latency,
+                effective_optimized_tokens = (
+                    total_input_tokens if total_input_tokens > 0 else optimized_tokens
+                )
+                effective_original_tokens = max(
+                    original_tokens,
+                    effective_optimized_tokens + tokens_saved,
+                )
+
+                _resp_log_tags = {
+                    **(tags or {}),
+                    "auth_mode": auth_mode.value if auth_mode else "payg",
+                    "endpoint": "responses_http",
+                }
+
+                # OpenAI Responses HTTP (non-WS, non-streaming). Codex
+                # uses this path when configured for HTTP transport.
+                # Pre-refactor `cache_hit` was hardcoded False on
+                # RequestLog even when cache_read>0 — funnel derives
+                # it correctly.
+                from headroom.proxy.helpers import compute_turn_id
+
+                await self._record_request_outcome(
+                    RequestOutcome(
+                        request_id=request_id,
+                        provider="openai",
+                        model=model,
+                        original_tokens=effective_original_tokens,
+                        optimized_tokens=effective_optimized_tokens,
+                        output_tokens=output_tokens,
+                        tokens_saved=tokens_saved,
+                        attempted_input_tokens=attempted_input_tokens,
+                        cache_read_tokens=cache_read_tokens,
+                        cache_write_tokens=cache_write_tokens,
+                        uncached_input_tokens=uncached_input_tokens,
+                        total_latency_ms=total_latency,
+                        overhead_ms=optimization_latency,
+                        transforms_applied=tuple(transforms_applied),
+                        num_messages=len(messages) if isinstance(messages, list) else 0,
+                        tags=_resp_log_tags,
+                        turn_id=compute_turn_id(model, body.get("instructions"), messages),
+                        request_messages=messages
+                        if getattr(self.config, "log_full_messages", False)
+                        else None,
+                        client=client,
+                    )
                 )
 
                 logger.info(f"[{request_id}] /v1/responses {model}: {total_input_tokens:,} tokens")
@@ -1428,15 +2909,11 @@ class OpenAIHandlerMixin:
         Responses API.  This handler:
         1. Accepts the client WebSocket
         2. Receives the first message (``response.create`` request)
-        3. Compresses the ``input`` array using the existing pipeline
-        4. Opens an upstream WebSocket to OpenAI
-        5. Sends the compressed request upstream
-        6. Relays all subsequent messages bidirectionally
+        3. Opens an upstream WebSocket to OpenAI
+        4. Compresses eligible `response.create` text through the Python
+           ContentRouter path, then sends the request upstream
+        5. Relays all subsequent messages bidirectionally
         """
-        from headroom.proxy.helpers import COMPRESSION_TIMEOUT_SECONDS
-        from headroom.tokenizers import get_tokenizer
-        from headroom.utils import extract_user_query
-
         try:
             import websockets
         except ImportError:
@@ -1464,6 +2941,48 @@ class OpenAIHandlerMixin:
 
         # Forward client headers to upstream, adding required OpenAI-Beta header
         ws_headers = dict(websocket.headers)
+        # Identify the WS harness before downstream auth/header rewrites.
+        # Captured in closure so per-turn RequestOutcome can stamp it.
+        client = classify_client(ws_headers)
+        _ws_url_obj = getattr(websocket, "url", None)
+        _ws_url = str(_ws_url_obj) if _ws_url_obj is not None else ""
+        _ws_path = getattr(_ws_url_obj, "path", "") if _ws_url_obj is not None else ""
+        if not _ws_path:
+            _ws_path = "/v1/responses"
+        metrics_for_inbound_ws = getattr(self, "metrics", None)
+        if metrics_for_inbound_ws is not None and hasattr(
+            metrics_for_inbound_ws, "record_inbound_request"
+        ):
+            with contextlib.suppress(Exception):
+                metrics_for_inbound_ws.record_inbound_request(method="WS", path=_ws_path)
+        logger.info(
+            "event=proxy_inbound_websocket request_id=%s session_id=%s path=%s "
+            "client=%s header_count=%d",
+            request_id,
+            session_id,
+            _ws_path,
+            getattr(websocket, "client", ""),
+            len(ws_headers),
+        )
+        from headroom.proxy.helpers import capture_codex_wire_debug
+
+        capture_codex_wire_debug(
+            "ws_inbound_handshake",
+            request_id=request_id,
+            session_id=session_id,
+            transport="websocket",
+            direction="client_to_headroom",
+            url=_ws_url,
+            headers=ws_headers,
+            metadata={"path": _ws_path},
+        )
+        # Extract per-request tags from headers up front so the
+        # session-end RequestLog can attach them. `_extract_tags` is
+        # the same helper the HTTP handlers use; on a WebSocket the
+        # tags come from `x-headroom-tag-*` headers in the upgrade
+        # handshake. Returns `{}` when no tags are present.
+        _extract_ws_tags = getattr(self, "_extract_tags", None)
+        ws_tags = _extract_ws_tags(ws_headers) if callable(_extract_ws_tags) else {}
 
         # Extract subprotocol from client — this is an application-level negotiation
         # that MUST be forwarded end-to-end (unlike sec-websocket-key which is per-connection).
@@ -1523,10 +3042,30 @@ class OpenAIHandlerMixin:
                 "transfer-encoding",  # hop-by-hop
             }
         )
-        upstream_headers: dict[str, str] = {}
+        # PR-A5 (P5-49): also drop internal x-headroom-* from the upstream
+        # WebSocket handshake. Inbound reads on `ws_headers` (memory user-id
+        # below) keep working because we filter only when building
+        # `upstream_headers`, not when reading from `ws_headers`.
+        from headroom.proxy.helpers import (
+            _strip_internal_headers as _strip_internal,
+        )
+        from headroom.proxy.helpers import (
+            log_outbound_headers as _log_outbound_headers,
+        )
+
+        _ws_pre_strip_filtered: dict[str, str] = {}
         for k, v in ws_headers.items():
             if k.lower() not in _skip_headers:
-                upstream_headers[k] = v
+                _ws_pre_strip_filtered[k] = v
+        _ws_pre_strip_count = sum(
+            1 for k in _ws_pre_strip_filtered if k.lower().startswith("x-headroom-")
+        )
+        upstream_headers = _strip_internal(_ws_pre_strip_filtered)
+        _log_outbound_headers(
+            forwarder="openai_responses_ws",
+            stripped_count=_ws_pre_strip_count,
+            request_id=request_id,
+        )
 
         upstream_headers, is_chatgpt_auth = _resolve_codex_routing_headers(upstream_headers)
         _lower_headers = {k.lower(): v for k, v in upstream_headers.items()}
@@ -1544,9 +3083,31 @@ class OpenAIHandlerMixin:
             ws_base = base.replace("https://", "wss://").replace("http://", "ws://")
             upstream_url = build_copilot_upstream_url(ws_base, "/v1/responses")
 
+        capture_codex_wire_debug(
+            "ws_upstream_handshake",
+            request_id=request_id,
+            session_id=session_id,
+            transport="websocket",
+            direction="headroom_to_upstream",
+            url=upstream_url,
+            headers=upstream_headers,
+            metadata={
+                "is_chatgpt_auth": is_chatgpt_auth,
+                "subprotocols": client_subprotocols,
+            },
+        )
+
         # Unit 3: attach the resolved upstream URL to the session handle.
         if session_handle is not None:
             session_handle.upstream_url = upstream_url
+
+        logger.info(
+            "[%s] WS /v1/responses accepted (route=%s, auth_mode=%s, subprotocols=%s)",
+            request_id,
+            "chatgpt_subscription" if is_chatgpt_auth else "openai_api",
+            classify_auth_mode(ws_headers).value,
+            client_subprotocols,
+        )
 
         # Ensure Authorization header is present — fall back to OPENAI_API_KEY env var.
         # Safety net for clients that don't forward auth headers via WebSocket upgrade.
@@ -1564,9 +3125,73 @@ class OpenAIHandlerMixin:
         upstream_headers = await apply_copilot_api_auth(upstream_headers, url=upstream_url)
 
         # Ensure the required beta header is present — OpenAI returns 500 without it.
-        # Codex sends `responses_websockets=2026-02-06`; only inject if missing entirely.
-        if "openai-beta" not in _lower_headers:
-            upstream_headers["OpenAI-Beta"] = "responses_websockets=2026-02-06"
+        # PR-A6 (P5-50): use the deterministic `merge_openai_beta` helper
+        # so the auto-injected `responses_websockets=2026-02-06` is
+        # appended to the client's value (preserving order, deduping
+        # case-insensitively) rather than overwriting it. The
+        # SessionBetaTracker also records the merge so a future cross-
+        # connection sticky model can replay tokens by session_id.
+        from headroom.proxy.helpers import (
+            get_session_beta_tracker as _get_session_beta_tracker_ws,
+        )
+        from headroom.proxy.helpers import (
+            log_beta_header_merge as _log_beta_header_merge_ws,
+        )
+        from headroom.proxy.helpers import merge_openai_beta as _merge_openai_beta_ws
+
+        _ws_required_tokens = ["responses_websockets=2026-02-06"]
+        # Read the original (pre-merge) client value from the WS headers
+        # to preserve casing and ordering.
+        _ws_client_beta_value: str | None = None
+        for _k, _v in upstream_headers.items():
+            if _k.lower() == "openai-beta":
+                _ws_client_beta_value = _v
+                break
+        # Record session-stickiness BEFORE adding required tokens so the
+        # tracker stores the canonical client baseline.
+        _ws_sticky_beta = _get_session_beta_tracker_ws().record_and_get_sticky_betas(
+            provider="openai",
+            session_id=session_id,
+            client_value=_ws_client_beta_value,
+        )
+        _ws_merged_beta = _merge_openai_beta_ws(_ws_sticky_beta, _ws_required_tokens)
+        # Replace any existing case-variants of openai-beta with the
+        # canonical "OpenAI-Beta" key carrying the merged value.
+        _ws_existing_keys = [_k for _k in upstream_headers if _k.lower() == "openai-beta"]
+        for _k in _ws_existing_keys:
+            del upstream_headers[_k]
+        if _ws_merged_beta:
+            upstream_headers["OpenAI-Beta"] = _ws_merged_beta
+        _ws_client_beta_count = (
+            len([t for t in (_ws_client_beta_value or "").split(",") if t.strip()])
+            if _ws_client_beta_value
+            else 0
+        )
+        _ws_merged_beta_count = (
+            len([t for t in _ws_merged_beta.split(",") if t.strip()]) if _ws_merged_beta else 0
+        )
+        _log_beta_header_merge_ws(
+            provider="openai",
+            session_id=session_id,
+            client_betas_count=_ws_client_beta_count,
+            sticky_betas_count=_ws_merged_beta_count,
+            headroom_added=_ws_required_tokens,
+            request_id=request_id,
+        )
+
+        capture_codex_wire_debug(
+            "ws_upstream_handshake_final",
+            request_id=request_id,
+            session_id=session_id,
+            transport="websocket",
+            direction="headroom_to_upstream",
+            url=upstream_url,
+            headers=upstream_headers,
+            metadata={
+                "is_chatgpt_auth": is_chatgpt_auth,
+                "subprotocols": client_subprotocols,
+            },
+        )
 
         logger.debug(
             f"[{request_id}] WS upstream headers: "
@@ -1602,93 +3227,176 @@ class OpenAIHandlerMixin:
                 # deregister / metrics / stage-timings emission as usual.
                 return
 
-            # --- Optional: compress the input in the first message ---
+            # The standalone Rust proxy has a native Responses path, but the
+            # CLI runtime runs this Python proxy. Compress eligible
+            # `response.create` frames through the shared Python
+            # CompressionUnit + ContentRouter path before upstream send.
+            # Subsequent client→upstream frames are now ALSO compressed
+            # via `_maybe_compress_response_create_frame` in
+            # `_client_to_upstream` so long-lived subscription Codex
+            # sessions get savings on every turn, not just the first.
+
+            def _log_ws_passthrough(
+                reason: str,
+                *,
+                frame_index: int,
+                raw_bytes: int,
+                frame_type: str = "",
+                model: str = "",
+            ) -> None:
+                logger.info(
+                    "[%s] WS /v1/responses frame passthrough "
+                    "reason=%s frame=%d bytes=%d type=%s auth_mode=%s model=%s",
+                    request_id,
+                    reason,
+                    frame_index,
+                    raw_bytes,
+                    frame_type or "unknown",
+                    classify_auth_mode(ws_headers).value,
+                    model or "unknown",
+                )
+
             body: dict[str, Any] = {}
+            tokens_saved = 0
+            # Session-scoped accumulator for tokens we *attempted* to
+            # compress (extracted units + schema). Drives the active-
+            # compression ratio surfaced to the dashboard.
+            attempted_input_tokens_total = 0
+            transforms_applied: list[str] = []
+            ws_frames_compressed = 0
             try:
                 body = json.loads(first_msg_raw)
-                tokens_saved = 0
-                ws_request_body = body.get("response", body)
-                input_data = (
-                    ws_request_body.get("input") if isinstance(ws_request_body, dict) else None
-                )
-
-                should_compress = (
-                    self.config.optimize
-                    and isinstance(input_data, list)
-                    and len(input_data) > 1
-                    and not (
-                        ws_request_body.get("previous_response_id")
-                        if isinstance(ws_request_body, dict)
-                        else None
-                    )
-                )
-                if should_compress:
-                    try:
-                        from headroom.proxy.responses_converter import (
-                            messages_to_responses_items,
-                            responses_items_to_messages,
-                        )
-
-                        model = ws_request_body.get("model", "gpt-4o")
-                        converted, preserved = responses_items_to_messages(input_data)
-
-                        messages: list[dict[str, Any]] = []
-                        instructions = ws_request_body.get("instructions")
-                        if instructions:
-                            messages.append({"role": "system", "content": instructions})
-                        messages.extend(converted)
-
-                        tokenizer = get_tokenizer(model)
-                        original_tokens = tokenizer.count_messages(messages)
-
-                        context_limit = self.openai_provider.get_context_limit(model)
-                        async with stage_timer.measure("compression"):
-                            result = await asyncio.wait_for(
-                                asyncio.to_thread(
-                                    lambda: self.openai_pipeline.apply(
-                                        messages=messages,
-                                        model=model,
-                                        model_limit=context_limit,
-                                        context=extract_user_query(messages),
-                                    )
-                                ),
-                                timeout=COMPRESSION_TIMEOUT_SECONDS,
-                            )
-
-                        if result.messages != messages:
-                            opt = result.messages
-                            if instructions and opt and opt[0].get("role") == "system":
-                                ws_request_body["instructions"] = opt[0]["content"]
-                                opt = opt[1:]
-                            if result.tokens_after <= original_tokens:
-                                ws_request_body["input"] = messages_to_responses_items(
-                                    opt, input_data, preserved
-                                )
-                            else:
-                                logger.warning(
-                                    f"[{request_id}] WS optimization inflated tokens "
-                                    f"({original_tokens} -> {result.tokens_after}), reverting"
-                                )
-                            tokens_saved = max(0, original_tokens - result.tokens_after)
-                            if "response" in body and isinstance(body["response"], dict):
-                                body["response"] = ws_request_body
-                            else:
-                                body = ws_request_body
-                            first_msg_raw = json.dumps(body)
-                            logger.info(
-                                f"[{request_id}] WS /v1/responses compressed: "
-                                f"saved {tokens_saved} tokens"
-                            )
-                    except Exception as e:
-                        logger.warning(f"[{request_id}] WS compression failed: {e}")
-
             except json.JSONDecodeError:
                 # Not JSON — pass through as-is
-                tokens_saved = 0
+                pass
+            ws_input_tokens_total = 0
+            ws_output_tokens_total = 0
+            ws_cache_read_tokens_total = 0
+            ws_cache_write_tokens_total = 0
+            ws_uncached_input_tokens_total = 0
+            ws_recorded_input_tokens_total = 0
+            ws_recorded_output_tokens_total = 0
+            ws_recorded_cache_read_tokens_total = 0
+            ws_recorded_cache_write_tokens_total = 0
+            ws_recorded_uncached_input_tokens_total = 0
+            ws_recorded_tokens_saved_total = 0
+            ws_recorded_attempted_input_tokens_total = 0
+            ws_response_create_frames = 1
+            ws_client_frames_total = 1
+            ws_upstream_frames_total = 0
+            ws_cancel_frames = 0
+            ws_last_client_frame_type = str(body.get("type") or "unknown") if body else "unknown"
+            ws_last_upstream_frame_type = "unknown"
+            ws_client_disconnect_seen = False
+            ws_overhead_ms_total = 0.0
+            ws_recorded_overhead_ms_total = 0.0
+            ws_compression_timing_totals: dict[str, float] = {}
+            ws_recorded_compression_timing_totals: dict[str, float] = {}
+            ws_ttfb_ms: float | None = None
+            ws_recorded_ttfb_ms = False
+            _ws_bypass = self._headroom_bypass_enabled(ws_headers)
+            if _ws_bypass:
+                logger.info(
+                    "[%s] WS /v1/responses passthrough reason=bypass_header mutation=disabled",
+                    request_id,
+                )
+
+            capture_codex_wire_debug(
+                "ws_inbound_first_frame",
+                request_id=request_id,
+                session_id=session_id,
+                transport="websocket",
+                direction="client_to_headroom",
+                url=_ws_url,
+                body=body if body else None,
+                raw_text=None if body else first_msg_raw,
+                metadata={"frame": 1},
+            )
+
+            def _record_ws_compression_overhead(duration_ms: float) -> None:
+                nonlocal ws_overhead_ms_total
+                ws_overhead_ms_total += max(0.0, float(duration_ms))
+                if ws_overhead_ms_total > 0:
+                    stage_timer.record("compression", ws_overhead_ms_total)
+
+            def _record_ws_compression_timing(name: str, duration_ms: float) -> None:
+                ws_compression_timing_totals[name] = ws_compression_timing_totals.get(
+                    name, 0.0
+                ) + max(0.0, float(duration_ms))
+
+            def _codex_ws_final_strategies(timing: dict[str, float]) -> list[str]:
+                prefix = "compression_unit_router_strategy_"
+                return [
+                    name.removeprefix(prefix)
+                    for name, ms in timing.items()
+                    if name.startswith(prefix) and ms > 0
+                ]
+
+            def _codex_ws_strategy_chain(transforms: list[str]) -> list[str]:
+                chain: list[str] = []
+                for transform in transforms:
+                    if ":" in transform:
+                        continue
+                    if transform not in chain:
+                        chain.append(transform)
+                return chain
+
+            def _current_ws_overhead_ms() -> float:
+                summary = stage_timer.summary()
+                return ws_overhead_ms_total + max(0.0, float(summary.get("memory_context") or 0.0))
+
+            def _ws_dashboard_pipeline_timing(
+                *,
+                overhead_ms: float,
+                ttfb_ms: float,
+            ) -> dict[str, float]:
+                timing: dict[str, float] = {}
+                if overhead_ms > 0:
+                    timing["codex_ws.compression"] = overhead_ms
+                if ttfb_ms > 0:
+                    timing["codex_ws.ttfb"] = ttfb_ms
+
+                for stage_name, total_ms in ws_compression_timing_totals.items():
+                    recorded_ms = ws_recorded_compression_timing_totals.get(stage_name, 0.0)
+                    delta_ms = max(0.0, total_ms - recorded_ms)
+                    if delta_ms > 0:
+                        timing[f"codex_ws.{stage_name}"] = delta_ms
+
+                summary = stage_timer.summary()
+                for stage_name in (
+                    "memory_context",
+                    "upstream_connect",
+                    "upstream_first_event",
+                ):
+                    value = summary.get(stage_name)
+                    if value is not None and value > 0:
+                        timing[f"codex_ws.{stage_name}"] = float(value)
+                return timing
+
+            def _prepare_ws_performance_metrics() -> tuple[float, float, dict[str, float]]:
+                current_overhead_ms = _current_ws_overhead_ms()
+                overhead_delta_ms = max(
+                    0.0,
+                    current_overhead_ms - ws_recorded_overhead_ms_total,
+                )
+                ttfb_for_record_ms = (
+                    max(0.0, float(ws_ttfb_ms))
+                    if ws_ttfb_ms is not None and not ws_recorded_ttfb_ms
+                    else 0.0
+                )
+                return (
+                    overhead_delta_ms,
+                    ttfb_for_record_ms,
+                    _ws_dashboard_pipeline_timing(
+                        overhead_ms=overhead_delta_ms,
+                        ttfb_ms=ttfb_for_record_ms,
+                    ),
+                )
 
             # --- Memory: inject context, tools, and instructions ---
             memory_user_id: str | None = None
-            if self.memory_handler and body:
+            memory_request_ctx = None
+            if self.memory_handler and body and not _ws_bypass:
                 memory_user_id = ws_headers.get(
                     "x-headroom-user-id",
                     os.environ.get("USER", os.environ.get("USERNAME", "default")),
@@ -1696,6 +3404,23 @@ class OpenAIHandlerMixin:
                 try:
                     # Unwrap response.create envelope to access the response body
                     ws_response_body = body.get("response", body)
+
+                    # Per-project memory routing (GH #462). For WS,
+                    # ``ws_response_body`` carries ``instructions`` —
+                    # that's the system-prompt-equivalent we feed to the
+                    # resolver.
+                    from headroom.memory.storage_router import (
+                        RequestContext as _MemRequestContext,
+                    )
+
+                    memory_request_ctx = _MemRequestContext(
+                        headers=dict(ws_headers),
+                        system_prompt=str(ws_response_body.get("instructions") or ""),
+                        base_user_id=memory_user_id,
+                        project_root_override=(
+                            getattr(self.memory_handler.config, "project_root_override", "") or None
+                        ),
+                    )
 
                     # Debug: log what Codex sends so we can see the full tool list
                     existing_tool_names = [
@@ -1718,19 +3443,19 @@ class OpenAIHandlerMixin:
                             ws_msgs.append({"role": "system", "content": ws_instructions})
                         if isinstance(ws_input, str) and ws_input:
                             ws_msgs.append({"role": "user", "content": ws_input})
-                        elif isinstance(ws_input, list):
-                            from headroom.proxy.responses_converter import (
-                                responses_items_to_messages,
-                            )
-
-                            converted_msgs, _ = responses_items_to_messages(ws_input)
-                            ws_msgs.extend(converted_msgs)
+                        # PR-C5: list-typed `input` no longer feeds memory
+                        # search via the Python converter — the Rust handler
+                        # owns native item-aware processing. Memory context
+                        # for list-input WS sessions falls back to the
+                        # `instructions` system message only.
 
                         try:
                             async with stage_timer.measure("memory_context"):
                                 memory_context = await asyncio.wait_for(
                                     self.memory_handler.search_and_format_context(
-                                        memory_user_id, ws_msgs
+                                        memory_user_id,
+                                        ws_msgs,
+                                        request_context=memory_request_ctx,
                                     ),
                                     timeout=RESPONSES_CONTEXT_SEARCH_TIMEOUT_SECONDS,
                                 )
@@ -1752,51 +3477,68 @@ class OpenAIHandlerMixin:
                                 f"of context into instructions"
                             )
 
-                    # Inject memory tools (Responses API format)
-                    if self.memory_handler.config.inject_tools:
-                        ws_tools = ws_response_body.get("tools") or []
-                        ws_tools, mem_injected = self.memory_handler.inject_tools(
-                            ws_tools, "openai"
-                        )
-                        if mem_injected:
-                            converted_tools = []
-                            for t in ws_tools:
-                                if t.get("type") == "function" and "function" in t:
-                                    fn = t["function"]
-                                    converted_tools.append(
-                                        {
-                                            "type": "function",
-                                            "name": fn.get("name"),
-                                            "description": fn.get("description", ""),
-                                            "parameters": fn.get("parameters", {}),
-                                        }
-                                    )
-                                else:
-                                    converted_tools.append(t)
-                            ws_response_body["tools"] = converted_tools
+                    # Inject memory tools (Responses API format) — PR-A7 (P0-6).
+                    # WS path uses a per-connection UUID; tracker scope is
+                    # the WS session (short-lived). Pre-convert to Responses
+                    # API format so canonical bytes match the wire format.
+                    from headroom.proxy.helpers import (
+                        apply_session_sticky_memory_tools as _apply_sticky_mem_tools_ws,
+                    )
 
-                            # Add memory instruction so the model uses
-                            # memory tools as persistent cross-session knowledge.
-                            mem_instruction = (
-                                "\n\n## Memory\n"
-                                "You have persistent memory via memory_search and "
-                                "memory_save tools. Memory stores knowledge across "
-                                "sessions — user info, project details, org context, "
-                                "decisions, architecture, conventions, anything worth "
-                                "remembering.\n\n"
-                                "- ALWAYS call memory_search BEFORE searching files "
-                                "when the user asks a question that could be answered "
-                                "from prior knowledge.\n"
-                                "- Call memory_save to store important facts, decisions, "
-                                "or context that would be useful in future sessions.\n"
-                                "- Memory is your first source of truth for anything "
-                                "not visible in the current conversation."
+                    ws_mem_defs_chat = (
+                        self.memory_handler.compute_memory_tool_definitions("openai")
+                        if self.memory_handler.config.inject_tools
+                        else []
+                    )
+                    ws_mem_defs_responses: list[dict[str, Any]] = []
+                    for t in ws_mem_defs_chat:
+                        if t.get("type") == "function" and "function" in t:
+                            fn = t["function"]
+                            ws_mem_defs_responses.append(
+                                {
+                                    "type": "function",
+                                    "name": fn.get("name"),
+                                    "description": fn.get("description", ""),
+                                    "parameters": fn.get("parameters", {}),
+                                }
                             )
-                            existing_instr = ws_response_body.get("instructions") or ""
-                            ws_response_body["instructions"] = existing_instr + mem_instruction
-                            logger.info(
-                                f"[{request_id}] WS Memory: Injected memory tools + instruction"
-                            )
+                        else:
+                            ws_mem_defs_responses.append(t)
+
+                    ws_tools = ws_response_body.get("tools") or []
+                    ws_tools, mem_injected = _apply_sticky_mem_tools_ws(
+                        provider="openai",
+                        session_id=session_id,
+                        request_id=request_id,
+                        existing_tools=ws_tools,
+                        memory_tools_to_inject=ws_mem_defs_responses,
+                        inject_this_turn=bool(self.memory_handler.config.inject_tools),
+                    )
+                    if mem_injected:
+                        ws_response_body["tools"] = ws_tools
+
+                        # Add memory instruction so the model uses
+                        # memory tools as persistent cross-session knowledge.
+                        mem_instruction = (
+                            "\n\n## Memory\n"
+                            "You have persistent memory via memory_search and "
+                            "memory_save tools. Memory stores knowledge across "
+                            "sessions — user info, project details, org context, "
+                            "decisions, architecture, conventions, anything worth "
+                            "remembering.\n\n"
+                            "- ALWAYS call memory_search BEFORE searching files "
+                            "when the user asks a question that could be answered "
+                            "from prior knowledge.\n"
+                            "- Call memory_save to store important facts, decisions, "
+                            "or context that would be useful in future sessions.\n"
+                            "- Memory is your first source of truth for anything "
+                            "not visible in the current conversation."
+                        )
+                        existing_instr = ws_response_body.get("instructions") or ""
+                        ws_response_body["instructions"] = existing_instr + mem_instruction
+                        logger.info(
+                            f"[{request_id}] WS Memory: Injected memory tools + instruction"
+                        )
 
                     # Write back into envelope if it was wrapped
                     if "response" in body and isinstance(body["response"], dict):
@@ -1807,6 +3549,201 @@ class OpenAIHandlerMixin:
                     first_msg_raw = json.dumps(body)
                 except Exception as e:
                     logger.warning(f"[{request_id}] WS Memory injection failed: {e}")
+            elif self.memory_handler and body and _ws_bypass:
+                logger.info(
+                    "[%s] WS memory passthrough reason=bypass_header",
+                    request_id,
+                )
+
+            # Hot-fix follow-up to PR #406 — inline Rust compression on the
+            # WS first frame before forwarding upstream. PR #406 enabled
+            # the same call for HTTP /v1/responses; PR-C5's "WS-side
+            # compression is a follow-up" note is closed here. Codex
+            # subscription users default to WebSocket transport for
+            # /v1/responses (proxy-confirmed via #409 reviewer testing),
+            # so without this call subscription traffic flows through
+            # Headroom uncompressed.
+            #
+            # The first frame may be either:
+            #   • {"type": "response.create", "response": {...payload...}}
+            #   • the payload directly (older shapes)
+            # We unwrap, compress the inner payload via the PyO3 dispatcher,
+            # and re-wrap so both shapes work.
+            #
+            # Re-parses from `first_msg_raw` rather than reusing `body`
+            # because `body` may be partially mutated if memory injection
+            # raised an exception above (in which case `first_msg_raw` is
+            # the canonical pre-memory bytes that will actually be sent
+            # upstream). The PyO3 binding never raises (passthrough on
+            # internal errors), but we wrap the call site in try/except
+            # anyway so a JSON-shape edge case can never break the WS
+            # session.
+            if self.config.optimize and not _ws_bypass:
+                _first_frame_compression_elapsed_ms = 0.0
+                try:
+                    _preflight_started = time.perf_counter()
+                    _ws_auth_mode = classify_auth_mode(ws_headers)
+                    try:
+                        _send_body = json.loads(first_msg_raw)
+                    except json.JSONDecodeError:
+                        _send_body = None
+
+                    if isinstance(_send_body, dict):
+                        _wrapped = "response" in _send_body and isinstance(
+                            _send_body["response"], dict
+                        )
+                        _inner = _send_body["response"] if _wrapped else _send_body
+                        _model = (_inner.get("model") if isinstance(_inner, dict) else None) or ""
+
+                        _preflight_ms = (time.perf_counter() - _preflight_started) * 1000.0
+                        _record_ws_compression_timing(
+                            "compression_preflight_serialization",
+                            _preflight_ms,
+                        )
+                        _record_ws_compression_overhead(_preflight_ms)
+                        _compression_started = time.perf_counter()
+                        try:
+                            (
+                                _new_inner,
+                                _modified,
+                                _ws_saved,
+                                _ws_transforms,
+                                _ws_reason,
+                                _bytes_before,
+                                _bytes_after,
+                                _ws_attempted_tokens,
+                                _ws_compression_timing,
+                            ) = await self._compress_openai_responses_payload_in_executor(
+                                _inner,
+                                model=_model,
+                                request_id=request_id,
+                            )
+                            for _timing_name, _timing_ms in _ws_compression_timing.items():
+                                _record_ws_compression_timing(_timing_name, _timing_ms)
+                        finally:
+                            _first_frame_compression_elapsed_ms = (
+                                time.perf_counter() - _compression_started
+                            ) * 1000.0
+                            _record_ws_compression_timing(
+                                "compression_executor_wait_run",
+                                _first_frame_compression_elapsed_ms,
+                            )
+                            _record_ws_compression_overhead(_first_frame_compression_elapsed_ms)
+                        record_frame = getattr(
+                            getattr(self, "metrics", None), "record_codex_ws_frame", None
+                        )
+                        if record_frame is not None:
+                            record_frame(
+                                elapsed_ms=_first_frame_compression_elapsed_ms,
+                                bytes_before=_bytes_before,
+                                bytes_after=_bytes_after,
+                                attempted_tokens=_ws_attempted_tokens,
+                                tokens_saved=_ws_saved,
+                                modified=_modified,
+                                strategy_chain=_codex_ws_strategy_chain(_ws_transforms),
+                                final_strategies=_codex_ws_final_strategies(_ws_compression_timing),
+                            )
+                        if _modified:
+                            if isinstance(_new_inner, dict):
+                                _rewrite_started = time.perf_counter()
+                                if _wrapped:
+                                    _send_body["response"] = _new_inner
+                                else:
+                                    _send_body = _new_inner
+                                first_msg_raw = json.dumps(_send_body)
+                                _rewrite_ms = (time.perf_counter() - _rewrite_started) * 1000.0
+                                _record_ws_compression_timing(
+                                    "compression_payload_rewrite_json_dump",
+                                    _rewrite_ms,
+                                )
+                                _record_ws_compression_overhead(_rewrite_ms)
+                                tokens_saved += int(_ws_saved)
+                                attempted_input_tokens_total += int(_ws_attempted_tokens)
+                                for _t in _ws_transforms:
+                                    if _t not in transforms_applied:
+                                        transforms_applied.append(_t)
+                                logger.info(
+                                    "[%s] WS /v1/responses compressed "
+                                    "%d→%d bytes (%d tokens saved, "
+                                    "auth_mode=%s, transforms=%s)",
+                                    request_id,
+                                    _bytes_before,
+                                    _bytes_after,
+                                    int(_ws_saved),
+                                    _ws_auth_mode.value,
+                                    transforms_applied,
+                                )
+                                ws_frames_compressed += 1
+                        else:
+                            _log_ws_passthrough(
+                                _ws_reason or "no_compression",
+                                frame_index=1,
+                                raw_bytes=_bytes_before,
+                                frame_type=str(_send_body.get("type") or "response.create"),
+                                model=_model or "unknown",
+                            )
+                    else:
+                        _log_ws_passthrough(
+                            "first_frame_non_json",
+                            frame_index=1,
+                            raw_bytes=len(first_msg_raw.encode("utf-8", errors="replace")),
+                            frame_type="unknown",
+                        )
+                except Exception as _ce:
+                    if _first_frame_compression_elapsed_ms > 0:
+                        record_frame = getattr(
+                            getattr(self, "metrics", None), "record_codex_ws_frame", None
+                        )
+                        if record_frame is not None:
+                            record_frame(
+                                elapsed_ms=_first_frame_compression_elapsed_ms,
+                                bytes_before=len(first_msg_raw.encode("utf-8", errors="replace")),
+                                failed=True,
+                            )
+                    logger.warning(
+                        f"[{request_id}] WS /v1/responses compression failed; "
+                        f"forwarding original frame: {type(_ce).__name__}: {_ce}"
+                    )
+                    _log_ws_passthrough(
+                        "compression_exception",
+                        frame_index=1,
+                        raw_bytes=len(first_msg_raw.encode("utf-8", errors="replace")),
+                        frame_type="response.create" if body else "unknown",
+                        model=str(body.get("model") or "unknown")
+                        if isinstance(body, dict)
+                        else "unknown",
+                    )
+            else:
+                _log_ws_passthrough(
+                    "bypass_header" if _ws_bypass else "optimize_disabled",
+                    frame_index=1,
+                    raw_bytes=len(first_msg_raw.encode("utf-8", errors="replace")),
+                    frame_type="response.create" if body else "unknown",
+                    model=str(body.get("model") or "unknown")
+                    if isinstance(body, dict)
+                    else "unknown",
+                )
+
+            _first_upstream_body: Any = None
+            try:
+                _first_upstream_body = json.loads(first_msg_raw)
+            except json.JSONDecodeError:
+                _first_upstream_body = None
+            capture_codex_wire_debug(
+                "ws_upstream_first_frame",
+                request_id=request_id,
+                session_id=session_id,
+                transport="websocket",
+                direction="headroom_to_upstream",
+                url=upstream_url,
+                body=_first_upstream_body,
+                raw_text=None if _first_upstream_body is not None else first_msg_raw,
+                metadata={
+                    "frame": 1,
+                    "tokens_saved": tokens_saved,
+                    "transforms_applied": transforms_applied,
+                },
+            )
 
             # --- Connect to upstream OpenAI WebSocket ---
             logger.info(f"[{request_id}] WS /v1/responses connecting to {upstream_url}")
@@ -1862,11 +3799,300 @@ class OpenAIHandlerMixin:
                         upstream_relay_error: BaseException | None = None
                         client_relay_error: BaseException | None = None
 
+                        async def _maybe_compress_response_create_frame(
+                            raw_msg: str,
+                            *,
+                            frame_index: int,
+                        ) -> tuple[str, bool, str | None]:
+                            """Compress a single client→upstream frame
+                            when its `type` is `response.create`. Other
+                            event types (response.cancel, session.update,
+                            etc.) pass through unchanged. Errors are
+                            warned and the original frame is returned —
+                            fail loud in logs, fail safe on the wire.
+                            Updates outer-scope ``tokens_saved``,
+                            ``transforms_applied``, and
+                            ``ws_frames_compressed`` so the session-end
+                            log reports cumulative savings across all
+                            frames in the WS session.
+                            """
+                            nonlocal tokens_saved, transforms_applied, attempted_input_tokens_total
+                            nonlocal ws_frames_compressed
+                            if _ws_bypass:
+                                _log_ws_passthrough(
+                                    "bypass_header",
+                                    frame_index=frame_index,
+                                    raw_bytes=len(raw_msg.encode("utf-8", errors="replace")),
+                                )
+                                return raw_msg, False, "bypass_header"
+                            if not self.config.optimize:
+                                _log_ws_passthrough(
+                                    "optimize_disabled",
+                                    frame_index=frame_index,
+                                    raw_bytes=len(raw_msg.encode("utf-8", errors="replace")),
+                                )
+                                return raw_msg, False, "optimize_disabled"
+                            _preflight_started = time.perf_counter()
+                            try:
+                                parsed_frame = json.loads(raw_msg)
+                            except json.JSONDecodeError:
+                                _log_ws_passthrough(
+                                    "non_json",
+                                    frame_index=frame_index,
+                                    raw_bytes=len(raw_msg.encode("utf-8", errors="replace")),
+                                )
+                                return raw_msg, False, "non_json"
+                            if (
+                                not isinstance(parsed_frame, dict)
+                                or parsed_frame.get("type") != "response.create"
+                            ):
+                                _log_ws_passthrough(
+                                    "not_response_create",
+                                    frame_index=frame_index,
+                                    raw_bytes=len(raw_msg.encode("utf-8", errors="replace")),
+                                    frame_type=(
+                                        parsed_frame.get("type")
+                                        if isinstance(parsed_frame, dict)
+                                        else type(parsed_frame).__name__
+                                    ),
+                                )
+                                return raw_msg, False, "not_response_create"
+                            wrapped_frame = isinstance(parsed_frame.get("response"), dict)
+                            inner_payload = (
+                                parsed_frame["response"] if wrapped_frame else parsed_frame
+                            )
+                            if not isinstance(inner_payload, dict):
+                                _log_ws_passthrough(
+                                    "invalid_inner_payload",
+                                    frame_index=frame_index,
+                                    raw_bytes=len(raw_msg.encode("utf-8", errors="replace")),
+                                    frame_type="response.create",
+                                )
+                                return raw_msg, False, "invalid_inner_payload"
+                            frame_compression_elapsed_ms = 0.0
+                            try:
+                                model_for_frame = inner_payload.get("model") or ""
+                                _frame_auth_mode = classify_auth_mode(ws_headers)
+                                _preflight_ms = (time.perf_counter() - _preflight_started) * 1000.0
+                                _record_ws_compression_timing(
+                                    "compression_preflight_serialization",
+                                    _preflight_ms,
+                                )
+                                _record_ws_compression_overhead(_preflight_ms)
+                                _compression_started = time.perf_counter()
+                                try:
+                                    (
+                                        new_inner,
+                                        modified,
+                                        frame_saved,
+                                        frame_transforms,
+                                        frame_reason,
+                                        bytes_before,
+                                        bytes_after,
+                                        frame_attempted_tokens,
+                                        frame_compression_timing,
+                                    ) = await self._compress_openai_responses_payload_in_executor(
+                                        inner_payload,
+                                        model=model_for_frame,
+                                        request_id=request_id,
+                                    )
+                                    for (
+                                        _timing_name,
+                                        _timing_ms,
+                                    ) in frame_compression_timing.items():
+                                        _record_ws_compression_timing(_timing_name, _timing_ms)
+                                finally:
+                                    frame_compression_elapsed_ms = (
+                                        time.perf_counter() - _compression_started
+                                    ) * 1000.0
+                                    _record_ws_compression_timing(
+                                        "compression_executor_wait_run",
+                                        frame_compression_elapsed_ms,
+                                    )
+                                    _record_ws_compression_overhead(frame_compression_elapsed_ms)
+                                record_frame = getattr(
+                                    getattr(self, "metrics", None),
+                                    "record_codex_ws_frame",
+                                    None,
+                                )
+                                if record_frame is not None:
+                                    record_frame(
+                                        elapsed_ms=frame_compression_elapsed_ms,
+                                        bytes_before=bytes_before,
+                                        bytes_after=bytes_after,
+                                        attempted_tokens=frame_attempted_tokens,
+                                        tokens_saved=frame_saved,
+                                        modified=modified,
+                                        strategy_chain=_codex_ws_strategy_chain(frame_transforms),
+                                        final_strategies=_codex_ws_final_strategies(
+                                            frame_compression_timing
+                                        ),
+                                    )
+                            except Exception as _frame_err:
+                                if frame_compression_elapsed_ms > 0:
+                                    record_frame = getattr(
+                                        getattr(self, "metrics", None),
+                                        "record_codex_ws_frame",
+                                        None,
+                                    )
+                                    if record_frame is not None:
+                                        record_frame(
+                                            elapsed_ms=frame_compression_elapsed_ms,
+                                            bytes_before=len(
+                                                raw_msg.encode("utf-8", errors="replace")
+                                            ),
+                                            failed=True,
+                                        )
+                                logger.warning(
+                                    "[%s] WS /v1/responses frame compression "
+                                    "failed; forwarding original: %s: %s",
+                                    request_id,
+                                    type(_frame_err).__name__,
+                                    _frame_err,
+                                )
+                                _log_ws_passthrough(
+                                    "compression_exception",
+                                    frame_index=frame_index,
+                                    raw_bytes=len(raw_msg.encode("utf-8", errors="replace")),
+                                    frame_type="response.create",
+                                    model=str(inner_payload.get("model") or "unknown"),
+                                )
+                                return raw_msg, False, "compression_exception"
+                            if not modified:
+                                reason = frame_reason or "no_compression"
+                                _log_ws_passthrough(
+                                    reason,
+                                    frame_index=frame_index,
+                                    raw_bytes=bytes_before,
+                                    frame_type="response.create",
+                                    model=str(inner_payload.get("model") or "unknown"),
+                                )
+                                return raw_msg, False, reason
+                            if not isinstance(new_inner, dict):
+                                _log_ws_passthrough(
+                                    "compressed_payload_not_dict",
+                                    frame_index=frame_index,
+                                    raw_bytes=len(raw_msg.encode("utf-8", errors="replace")),
+                                    frame_type="response.create",
+                                    model=str(inner_payload.get("model") or "unknown"),
+                                )
+                                return raw_msg, False, "compressed_payload_not_dict"
+                            if wrapped_frame:
+                                _rewrite_started = time.perf_counter()
+                                parsed_frame["response"] = new_inner
+                                rewritten = json.dumps(parsed_frame)
+                            else:
+                                _rewrite_started = time.perf_counter()
+                                rewritten = json.dumps(new_inner)
+                            _rewrite_ms = (time.perf_counter() - _rewrite_started) * 1000.0
+                            _record_ws_compression_timing(
+                                "compression_payload_rewrite_json_dump",
+                                _rewrite_ms,
+                            )
+                            _record_ws_compression_overhead(_rewrite_ms)
+                            tokens_saved += int(frame_saved)
+                            attempted_input_tokens_total += int(frame_attempted_tokens)
+                            for t in frame_transforms:
+                                if t not in transforms_applied:
+                                    transforms_applied.append(t)
+                            ws_frames_compressed += 1
+                            logger.info(
+                                "[%s] WS /v1/responses frame compressed "
+                                "%d→%d bytes (%d tokens saved, "
+                                "auth_mode=%s, frame=%d)",
+                                request_id,
+                                bytes_before,
+                                bytes_after,
+                                int(frame_saved),
+                                _frame_auth_mode.value,
+                                ws_frames_compressed,
+                            )
+                            return rewritten, True, frame_reason or "compressed"
+
                         async def _client_to_upstream() -> None:
-                            nonlocal client_relay_error
+                            nonlocal client_relay_error, ws_response_create_frames
+                            nonlocal ws_client_frames_total, ws_cancel_frames
+                            nonlocal ws_last_client_frame_type, ws_client_disconnect_seen
+                            client_frame_index = 1
                             try:
                                 while True:
                                     msg = await websocket.receive_text()
+                                    client_frame_index += 1
+                                    ws_client_frames_total += 1
+                                    if session_handle is not None:
+                                        session_handle.mark_activity()
+                                    _inbound_frame_body: Any = None
+                                    try:
+                                        _inbound_frame_body = json.loads(msg)
+                                    except json.JSONDecodeError:
+                                        _inbound_frame_body = None
+                                    ws_last_client_frame_type = (
+                                        str(_inbound_frame_body.get("type") or "unknown")
+                                        if isinstance(_inbound_frame_body, dict)
+                                        else "non_json"
+                                    )
+                                    if ws_last_client_frame_type == "response.cancel":
+                                        ws_cancel_frames += 1
+                                        logger.info(
+                                            "[%s] WS client sent response.cancel "
+                                            "session_id=%s frame=%d cancels=%d",
+                                            request_id,
+                                            session_id,
+                                            client_frame_index,
+                                            ws_cancel_frames,
+                                        )
+                                    else:
+                                        logger.debug(
+                                            "[%s] WS client frame session_id=%s frame=%d type=%s",
+                                            request_id,
+                                            session_id,
+                                            client_frame_index,
+                                            ws_last_client_frame_type,
+                                        )
+                                    capture_codex_wire_debug(
+                                        "ws_inbound_client_frame",
+                                        request_id=request_id,
+                                        session_id=session_id,
+                                        transport="websocket",
+                                        direction="client_to_headroom",
+                                        url=_ws_url,
+                                        body=_inbound_frame_body,
+                                        raw_text=None if _inbound_frame_body is not None else msg,
+                                        metadata={"frame": client_frame_index},
+                                    )
+                                    if (
+                                        isinstance(_inbound_frame_body, dict)
+                                        and _inbound_frame_body.get("type") == "response.create"
+                                    ):
+                                        ws_response_create_frames += 1
+                                    (
+                                        msg,
+                                        _frame_modified,
+                                        _frame_reason,
+                                    ) = await _maybe_compress_response_create_frame(
+                                        msg,
+                                        frame_index=client_frame_index,
+                                    )
+                                    _outbound_frame_body: Any = None
+                                    try:
+                                        _outbound_frame_body = json.loads(msg)
+                                    except json.JSONDecodeError:
+                                        _outbound_frame_body = None
+                                    capture_codex_wire_debug(
+                                        "ws_upstream_client_frame",
+                                        request_id=request_id,
+                                        session_id=session_id,
+                                        transport="websocket",
+                                        direction="headroom_to_upstream",
+                                        url=upstream_url,
+                                        body=_outbound_frame_body,
+                                        raw_text=None if _outbound_frame_body is not None else msg,
+                                        metadata={
+                                            "frame": client_frame_index,
+                                            "tokens_saved_total": tokens_saved,
+                                            "transforms_applied": transforms_applied,
+                                        },
+                                    )
                                     await upstream.send(msg)
                             except asyncio.CancelledError:
                                 # Explicit cancel from the outer
@@ -1884,6 +4110,17 @@ class OpenAIHandlerMixin:
                                     client_relay_error = relay_err
                                     logger.debug(
                                         f"[{request_id}] WS client→upstream relay ended: {relay_err}"
+                                    )
+                                else:
+                                    ws_client_disconnect_seen = True
+                                    logger.info(
+                                        "[%s] WS client disconnected session_id=%s "
+                                        "frames=%d cancels=%d last_type=%s",
+                                        request_id,
+                                        session_id,
+                                        ws_client_frames_total,
+                                        ws_cancel_frames,
+                                        ws_last_client_frame_type,
                                     )
                                 with contextlib.suppress(Exception):
                                     await upstream.close()
@@ -1908,6 +4145,18 @@ class OpenAIHandlerMixin:
                             # over ``upstream_disconnect``.
                             nonlocal response_completed_seen
                             nonlocal upstream_relay_error
+                            nonlocal ws_input_tokens_total, ws_output_tokens_total
+                            nonlocal ws_cache_read_tokens_total, ws_cache_write_tokens_total
+                            nonlocal ws_uncached_input_tokens_total
+                            nonlocal ws_recorded_input_tokens_total
+                            nonlocal ws_recorded_output_tokens_total
+                            nonlocal ws_recorded_cache_read_tokens_total
+                            nonlocal ws_recorded_cache_write_tokens_total
+                            nonlocal ws_recorded_uncached_input_tokens_total
+                            nonlocal ws_recorded_tokens_saved_total
+                            nonlocal ws_recorded_overhead_ms_total, ws_recorded_ttfb_ms
+                            nonlocal ws_upstream_frames_total, ws_last_upstream_frame_type
+                            nonlocal ws_ttfb_ms
 
                             memory_enabled = bool(self.memory_handler and memory_user_id)
 
@@ -1926,39 +4175,261 @@ class OpenAIHandlerMixin:
                                 pending_fcs.clear()
                                 resp_id = None
 
+                            response_started_ms: float | None = None
+
+                            async def _record_ws_response_metrics() -> None:
+                                """Record one completed Responses turn on long-lived WS sessions."""
+                                nonlocal ws_recorded_input_tokens_total
+                                nonlocal ws_recorded_output_tokens_total
+                                nonlocal ws_recorded_cache_read_tokens_total
+                                nonlocal ws_recorded_cache_write_tokens_total
+                                nonlocal ws_recorded_uncached_input_tokens_total
+                                nonlocal ws_recorded_tokens_saved_total
+                                nonlocal ws_recorded_attempted_input_tokens_total
+                                nonlocal ws_recorded_overhead_ms_total, ws_recorded_ttfb_ms
+
+                                input_delta = ws_input_tokens_total - ws_recorded_input_tokens_total
+                                output_delta = (
+                                    ws_output_tokens_total - ws_recorded_output_tokens_total
+                                )
+                                cache_read_delta = (
+                                    ws_cache_read_tokens_total - ws_recorded_cache_read_tokens_total
+                                )
+                                cache_write_delta = (
+                                    ws_cache_write_tokens_total
+                                    - ws_recorded_cache_write_tokens_total
+                                )
+                                uncached_delta = (
+                                    ws_uncached_input_tokens_total
+                                    - ws_recorded_uncached_input_tokens_total
+                                )
+                                saved_delta = tokens_saved - ws_recorded_tokens_saved_total
+                                attempted_delta = (
+                                    attempted_input_tokens_total
+                                    - ws_recorded_attempted_input_tokens_total
+                                )
+                                (
+                                    overhead_delta_ms,
+                                    ttfb_for_record_ms,
+                                    dashboard_pipeline_timing,
+                                ) = _prepare_ws_performance_metrics()
+                                if (
+                                    input_delta <= 0
+                                    and output_delta <= 0
+                                    and cache_read_delta <= 0
+                                    and cache_write_delta <= 0
+                                    and uncached_delta <= 0
+                                    and saved_delta <= 0
+                                    and attempted_delta <= 0
+                                    and overhead_delta_ms <= 0
+                                    and ttfb_for_record_ms <= 0
+                                ):
+                                    return
+
+                                model_for_metrics = str(body.get("model") or "unknown")
+                                latency_ms = (
+                                    (time.perf_counter() * 1000.0 - response_started_ms)
+                                    if response_started_ms is not None
+                                    else 0.0
+                                )
+                                # Per-turn record: delta values capture
+                                # this turn's contribution since the
+                                # Codex WS handler accumulates session
+                                # totals. Pre-refactor this site
+                                # emitted only metrics + cost_tracker
+                                # — no RequestLog, no PERF — so Codex
+                                # traffic was invisible to
+                                # ``headroom perf`` and the recent-
+                                # requests feed. Funnel restores all
+                                # four effects uniformly per turn. Per-
+                                # turn outcomes carry ``ws_tags`` (the
+                                # `x-headroom-tag-*` headers extracted
+                                # at the WS upgrade) so dashboards can
+                                # slice WS turns by tag — same surface
+                                # as HTTP turns.
+                                await self._record_request_outcome(
+                                    RequestOutcome(
+                                        request_id=request_id,
+                                        provider="openai",
+                                        model=model_for_metrics,
+                                        original_tokens=max(0, input_delta) + max(0, saved_delta),
+                                        optimized_tokens=max(0, input_delta),
+                                        output_tokens=max(0, output_delta),
+                                        tokens_saved=max(0, saved_delta),
+                                        attempted_input_tokens=max(0, attempted_delta),
+                                        cache_read_tokens=max(0, cache_read_delta),
+                                        cache_write_tokens=max(0, cache_write_delta),
+                                        uncached_input_tokens=max(0, uncached_delta),
+                                        total_latency_ms=latency_ms,
+                                        overhead_ms=overhead_delta_ms,
+                                        ttfb_ms=ttfb_for_record_ms,
+                                        pipeline_timing=dashboard_pipeline_timing,
+                                        transforms_applied=tuple(transforms_applied),
+                                        num_messages=len(
+                                            body.get("messages") or body.get("input") or []
+                                        )
+                                        if isinstance(body, dict)
+                                        else 0,
+                                        tags=ws_tags,
+                                        client=client,
+                                    )
+                                )
+
+                                # Structured PERF log line so ``headroom perf``
+                                # counts this Codex turn. Pre-P2 this emit was
+                                # missing, which is why Codex traffic showed up
+                                # as ``Requests: 0`` in the perf report even
+                                # under heavy load — the same visibility bug
+                                # class as #327's "Cache write: 0" report.
+                                _perf_input_tokens = max(0, input_delta)
+                                _perf_cache_read = max(0, cache_read_delta)
+                                _perf_cache_write = max(0, cache_write_delta)
+                                _perf_cache_hit_pct = (
+                                    round(
+                                        _perf_cache_read
+                                        / (_perf_cache_read + _perf_cache_write)
+                                        * 100
+                                    )
+                                    if (_perf_cache_read + _perf_cache_write) > 0
+                                    else 0
+                                )
+                                _perf_tok_before = _perf_input_tokens + max(0, saved_delta)
+                                _perf_num_msgs = (
+                                    len(body.get("messages") or body.get("input") or [])
+                                    if isinstance(body, dict)
+                                    else 0
+                                )
+                                logger.info(
+                                    f"[{request_id}] PERF "
+                                    f"model={model_for_metrics} msgs={_perf_num_msgs} "
+                                    f"tok_before={_perf_tok_before} "
+                                    f"tok_after={_perf_input_tokens} "
+                                    f"tok_saved={max(0, saved_delta)} "
+                                    f"cache_read={_perf_cache_read} "
+                                    f"cache_write={_perf_cache_write} "
+                                    f"cache_hit_pct={_perf_cache_hit_pct} "
+                                    f"opt_ms={overhead_delta_ms:.0f} "
+                                    f"transforms={_summarize_transforms(transforms_applied)}"
+                                )
+
+                                ws_recorded_input_tokens_total = ws_input_tokens_total
+                                ws_recorded_output_tokens_total = ws_output_tokens_total
+                                ws_recorded_cache_read_tokens_total = ws_cache_read_tokens_total
+                                ws_recorded_cache_write_tokens_total = ws_cache_write_tokens_total
+                                ws_recorded_uncached_input_tokens_total = (
+                                    ws_uncached_input_tokens_total
+                                )
+                                ws_recorded_tokens_saved_total = tokens_saved
+                                ws_recorded_attempted_input_tokens_total = (
+                                    attempted_input_tokens_total
+                                )
+                                ws_recorded_overhead_ms_total = _current_ws_overhead_ms()
+                                ws_recorded_compression_timing_totals.update(
+                                    ws_compression_timing_totals
+                                )
+                                if ttfb_for_record_ms > 0:
+                                    ws_recorded_ttfb_ms = True
+
                             # The retry-loop variable is safe to close over here:
                             # ``_upstream_to_client`` is defined and awaited within
                             # a single iteration and never escapes.
                             _first_event_started_at = _upstream_first_event_started  # noqa: B023
 
                             try:
+                                upstream_frame_index = 0
                                 async for msg in upstream:
+                                    upstream_frame_index += 1
+                                    ws_upstream_frames_total += 1
+                                    if session_handle is not None:
+                                        session_handle.mark_activity()
                                     if (
                                         _first_event_started_at is not None
                                         and "upstream_first_event" not in stage_timer
                                     ):
+                                        if ws_ttfb_ms is None:
+                                            ws_ttfb_ms = (
+                                                time.perf_counter() - session_started_at
+                                            ) * 1000.0
                                         stage_timer.record(
                                             "upstream_first_event",
                                             (time.perf_counter() - _first_event_started_at)
                                             * 1000.0,
                                         )
                                     if isinstance(msg, bytes):
+                                        ws_last_upstream_frame_type = "binary"
+                                        capture_codex_wire_debug(
+                                            "ws_upstream_binary_frame",
+                                            request_id=request_id,
+                                            session_id=session_id,
+                                            transport="websocket",
+                                            direction="upstream_to_headroom",
+                                            url=upstream_url,
+                                            metadata={
+                                                "frame": upstream_frame_index,
+                                                "byte_count": len(msg),
+                                            },
+                                        )
                                         await websocket.send_bytes(msg)
                                         continue
                                     msg_str = msg if isinstance(msg, str) else str(msg)
-
-                                    if not memory_enabled:
-                                        await websocket.send_text(msg_str)
-                                        continue
+                                    _upstream_frame_body: Any = None
+                                    try:
+                                        _upstream_frame_body = json.loads(msg_str)
+                                    except json.JSONDecodeError:
+                                        _upstream_frame_body = None
+                                    capture_codex_wire_debug(
+                                        "ws_upstream_text_frame",
+                                        request_id=request_id,
+                                        session_id=session_id,
+                                        transport="websocket",
+                                        direction="upstream_to_headroom",
+                                        url=upstream_url,
+                                        body=_upstream_frame_body,
+                                        raw_text=None
+                                        if _upstream_frame_body is not None
+                                        else msg_str,
+                                        metadata={"frame": upstream_frame_index},
+                                    )
 
                                     # Parse event
                                     try:
                                         event = json.loads(msg_str)
                                     except (json.JSONDecodeError, TypeError):
+                                        ws_last_upstream_frame_type = "non_json"
                                         await websocket.send_text(msg_str)
                                         continue
 
                                     event_type = event.get("type", "")
+                                    ws_last_upstream_frame_type = str(event_type or "unknown")
+                                    logger.debug(
+                                        "[%s] WS upstream frame session_id=%s frame=%d type=%s",
+                                        request_id,
+                                        session_id,
+                                        upstream_frame_index,
+                                        ws_last_upstream_frame_type,
+                                    )
+                                    if event_type == "response.created":
+                                        response_started_ms = time.perf_counter() * 1000.0
+                                    (
+                                        usage_input_tokens,
+                                        usage_output_tokens,
+                                        usage_cache_read_tokens,
+                                        usage_cache_write_tokens,
+                                        usage_uncached_tokens,
+                                    ) = _extract_responses_usage(event)
+                                    if usage_input_tokens or usage_output_tokens:
+                                        ws_input_tokens_total += usage_input_tokens
+                                        ws_output_tokens_total += usage_output_tokens
+                                        ws_cache_read_tokens_total += usage_cache_read_tokens
+                                        ws_cache_write_tokens_total += usage_cache_write_tokens
+                                        ws_uncached_input_tokens_total += usage_uncached_tokens
+
+                                    if not memory_enabled:
+                                        if event_type == "response.completed":
+                                            response_completed_seen = True
+                                            await _record_ws_response_metrics()
+                                        await websocket.send_text(msg_str)
+                                        continue
 
                                     # --- Phase 1: Buffer until first output item ---
                                     if not decided:
@@ -1988,13 +4459,14 @@ class OpenAIHandlerMixin:
                                         elif event_type == "response.completed":
                                             # No output items at all — flush
                                             decided = True
-                                            for buf in event_buffer:
-                                                await websocket.send_text(buf)
-                                            event_buffer.clear()
-                                            _reset()
-                                            response_completed_seen = True
+                                    for buf in event_buffer:
+                                        await websocket.send_text(buf)
+                                    event_buffer.clear()
+                                    await _record_ws_response_metrics()
+                                    _reset()
+                                    response_completed_seen = True
 
-                                        continue
+                                    continue
 
                                     # --- Phase 2a: Suppress mode (memory response) ---
                                     if suppress_response:
@@ -2008,6 +4480,7 @@ class OpenAIHandlerMixin:
 
                                         elif event_type == "response.completed":
                                             response_completed_seen = True
+                                            await _record_ws_response_metrics()
                                             resp = event.get("response", {})
                                             resp_id = resp.get("id")
 
@@ -2192,6 +4665,13 @@ class OpenAIHandlerMixin:
                                         logger.debug(
                                             f"[{request_id}] WS relay {task_name} raised: {exc!r}"
                                         )
+                            if (
+                                ws_cancel_frames > 0
+                                and not response_completed_seen
+                                and termination_cause
+                                in {"upstream_disconnect", "client_disconnect", "unknown"}
+                            ):
+                                termination_cause = "client_cancel"
                         finally:
                             # In case anything above raised before the
                             # cancel-and-await loop ran.
@@ -2202,8 +4682,19 @@ class OpenAIHandlerMixin:
                                 await asyncio.gather(*relay_tasks, return_exceptions=True)
 
                         logger.info(
-                            f"[{request_id}] WS /v1/responses completed "
-                            f"(tokens_saved={tokens_saved}, cause={termination_cause})"
+                            "[%s] WS /v1/responses completed "
+                            "(tokens_saved=%d, cause=%s, client_frames=%d, upstream_frames=%d, "
+                            "cancel_frames=%d, client_disconnect=%s, last_client_type=%s, "
+                            "last_upstream_type=%s)",
+                            request_id,
+                            tokens_saved,
+                            termination_cause,
+                            ws_client_frames_total,
+                            ws_upstream_frames_total,
+                            ws_cancel_frames,
+                            ws_client_disconnect_seen,
+                            ws_last_client_frame_type,
+                            ws_last_upstream_frame_type,
                         )
                     break
                 except Exception as ws_err:
@@ -2236,7 +4727,9 @@ class OpenAIHandlerMixin:
                 if hasattr(ws_err, "response"):
                     resp_body = getattr(getattr(ws_err, "response", None), "body", b"")
                     if resp_body:
-                        _ws_detail += f" | {resp_body[:300].decode('utf-8', errors='replace')}"
+                        from headroom.proxy.helpers import safe_decode_for_logging
+
+                        _ws_detail += f" | {safe_decode_for_logging(resp_body, max_bytes=300)}"
                 logger.warning(
                     f"[{request_id}] WS upstream failed ({_ws_detail}), "
                     f"falling back to HTTP POST streaming"
@@ -2245,16 +4738,158 @@ class OpenAIHandlerMixin:
                     websocket, body, first_msg_raw, upstream_headers, request_id
                 )
 
-            # Record metrics
-            if tokens_saved > 0:
-                model_name = body.get("model", "unknown") if isinstance(body, dict) else "unknown"
-                await self.metrics.record_request(
-                    provider="openai",
-                    model=model_name,
-                    input_tokens=0,
-                    output_tokens=0,
-                    tokens_saved=tokens_saved,
-                    latency_ms=0,
+            # ── WS session-end metric + RequestLog ──────────────────
+            #
+            # Unconditional (was previously gated on `tokens_saved>0`,
+            # which made first-frame no-changes invisible). We record
+            # one entry per WS session that aggregates `tokens_saved`
+            # across every `response.create` frame compressed by the
+            # first-frame block + `_maybe_compress_response_create_frame`.
+            # The RequestLog entry mirrors the streaming.py /
+            # anthropic.py shape so /transformations/feed surfaces
+            # Codex WS turns.
+            ws_session_duration_ms = (time.perf_counter() - session_started_at) * 1000.0
+            ws_inner_for_telemetry: dict[str, Any] = (
+                body.get("response", body) if isinstance(body, dict) else {}
+            )
+            if not isinstance(ws_inner_for_telemetry, dict):
+                ws_inner_for_telemetry = {}
+            model_name = (
+                ws_inner_for_telemetry.get("model")
+                or (body.get("model") if isinstance(body, dict) else None)
+                or "unknown"
+            )
+            _final_auth_mode = classify_auth_mode(ws_headers)
+            residual_input_tokens = max(0, ws_input_tokens_total - ws_recorded_input_tokens_total)
+            residual_output_tokens = max(
+                0, ws_output_tokens_total - ws_recorded_output_tokens_total
+            )
+            residual_cache_read_tokens = max(
+                0, ws_cache_read_tokens_total - ws_recorded_cache_read_tokens_total
+            )
+            residual_cache_write_tokens = max(
+                0, ws_cache_write_tokens_total - ws_recorded_cache_write_tokens_total
+            )
+            residual_uncached_input_tokens = max(
+                0,
+                ws_uncached_input_tokens_total - ws_recorded_uncached_input_tokens_total,
+            )
+            residual_tokens_saved = max(0, tokens_saved - ws_recorded_tokens_saved_total)
+            residual_attempted_input_tokens = max(
+                0,
+                attempted_input_tokens_total - ws_recorded_attempted_input_tokens_total,
+            )
+            (
+                final_overhead_delta_ms,
+                final_ttfb_ms,
+                final_pipeline_timing,
+            ) = _prepare_ws_performance_metrics()
+            ws_session_tags = {
+                **(ws_tags or {}),
+                "auth_mode": _final_auth_mode.value,
+                "endpoint": "responses_ws",
+                "compression_scope": "live_zone",
+                "cache_policy": "prefix_safe",
+                "transport": "websocket",
+                "route": "chatgpt_subscription" if is_chatgpt_auth else "openai_api",
+                "ws_response_create_frames": str(ws_response_create_frames),
+                "ws_frames_compressed": str(ws_frames_compressed),
+                "ws_client_frames_total": str(ws_client_frames_total),
+                "ws_upstream_frames_total": str(ws_upstream_frames_total),
+                "ws_cancel_frames": str(ws_cancel_frames),
+                "ws_last_client_frame_type": ws_last_client_frame_type,
+                "ws_last_upstream_frame_type": ws_last_upstream_frame_type,
+                "ws_client_disconnect_seen": str(ws_client_disconnect_seen),
+                "ws_termination_cause": termination_cause,
+                "cache_read_tokens": str(ws_cache_read_tokens_total),
+                "cache_write_tokens": str(ws_cache_write_tokens_total),
+                "uncached_input_tokens": str(ws_uncached_input_tokens_total),
+            }
+            if (
+                residual_input_tokens > 0
+                or residual_output_tokens > 0
+                or residual_tokens_saved > 0
+                or residual_cache_read_tokens > 0
+                or residual_cache_write_tokens > 0
+                or residual_uncached_input_tokens > 0
+                or residual_attempted_input_tokens > 0
+                or final_overhead_delta_ms > 0
+                or final_ttfb_ms > 0
+            ):
+                # Session-end residual: tokens not captured by any
+                # per-turn record (e.g. signaling frames after the
+                # last response.completed). The funnel emits the full
+                # bookkeeping quartet for the residual; the explicit
+                # session-summary RequestLog below remains a separate
+                # entry (different semantics — cumulative session
+                # totals vs delta residual).
+                await self._record_request_outcome(
+                    RequestOutcome(
+                        request_id=request_id,
+                        provider="openai",
+                        model=model_name,
+                        original_tokens=residual_input_tokens + residual_tokens_saved,
+                        optimized_tokens=residual_input_tokens,
+                        output_tokens=residual_output_tokens,
+                        tokens_saved=residual_tokens_saved,
+                        attempted_input_tokens=residual_attempted_input_tokens,
+                        cache_read_tokens=residual_cache_read_tokens,
+                        cache_write_tokens=residual_cache_write_tokens,
+                        uncached_input_tokens=residual_uncached_input_tokens,
+                        total_latency_ms=ws_session_duration_ms,
+                        overhead_ms=final_overhead_delta_ms,
+                        ttfb_ms=final_ttfb_ms,
+                        pipeline_timing=final_pipeline_timing,
+                        transforms_applied=tuple(transforms_applied),
+                        tags=ws_session_tags,
+                        client=client,
+                    )
+                )
+                ws_recorded_overhead_ms_total = _current_ws_overhead_ms()
+                if final_ttfb_ms > 0:
+                    ws_recorded_ttfb_ms = True
+            if getattr(self, "logger", None) is not None:
+                from headroom.proxy.helpers import compute_turn_id
+                from headroom.proxy.models import RequestLog
+
+                ws_messages_for_log: list[dict[str, Any]] = []
+                ws_input_for_log = ws_inner_for_telemetry.get("input")
+                ws_instructions_for_log = ws_inner_for_telemetry.get("instructions")
+                if isinstance(ws_instructions_for_log, str) and ws_instructions_for_log:
+                    ws_messages_for_log.append(
+                        {"role": "system", "content": ws_instructions_for_log}
+                    )
+                if isinstance(ws_input_for_log, str) and ws_input_for_log:
+                    ws_messages_for_log.append({"role": "user", "content": ws_input_for_log})
+                self.logger.log(
+                    RequestLog(
+                        request_id=request_id,
+                        timestamp=datetime.now().isoformat(),
+                        provider="openai",
+                        model=model_name,
+                        input_tokens_original=ws_input_tokens_total + tokens_saved,
+                        input_tokens_optimized=ws_input_tokens_total,
+                        output_tokens=ws_output_tokens_total,
+                        tokens_saved=tokens_saved,
+                        savings_percent=(
+                            tokens_saved / (ws_input_tokens_total + tokens_saved) * 100
+                        )
+                        if ws_input_tokens_total + tokens_saved > 0
+                        else 0.0,
+                        optimization_latency_ms=_current_ws_overhead_ms(),
+                        total_latency_ms=ws_session_duration_ms,
+                        tags=ws_session_tags,
+                        cache_hit=False,
+                        transforms_applied=transforms_applied,
+                        request_messages=ws_messages_for_log
+                        if getattr(self.config, "log_full_messages", False)
+                        else None,
+                        turn_id=compute_turn_id(
+                            model_name,
+                            ws_instructions_for_log,
+                            ws_messages_for_log,
+                        ),
+                    )
                 )
 
         except Exception as e:
@@ -2273,8 +4908,10 @@ class OpenAIHandlerMixin:
                         resp = e.response
                         body_bytes = getattr(resp, "body", None) or b""
                         if body_bytes:
+                            from headroom.proxy.helpers import safe_decode_for_logging
+
                             error_detail += (
-                                f" | body: {body_bytes[:500].decode('utf-8', errors='replace')}"
+                                f" | body: {safe_decode_for_logging(body_bytes, max_bytes=500)}"
                             )
                     except Exception:
                         pass
@@ -2314,6 +4951,23 @@ class OpenAIHandlerMixin:
                             metrics_for_close.record_ws_session_duration(
                                 session_duration_ms, termination_cause
                             )
+            metrics_for_ws_inbound_close = getattr(self, "metrics", None)
+            if metrics_for_ws_inbound_close is not None and hasattr(
+                metrics_for_ws_inbound_close, "record_inbound_response"
+            ):
+                with contextlib.suppress(Exception):
+                    metrics_for_ws_inbound_close.record_inbound_response(
+                        status_code=f"ws:{termination_cause}"
+                    )
+            logger.info(
+                "event=proxy_inbound_websocket_closed request_id=%s session_id=%s "
+                "path=%s cause=%s duration_ms=%.2f",
+                request_id,
+                session_id,
+                _ws_path,
+                termination_cause,
+                (time.perf_counter() - session_started_at) * 1000.0,
+            )
             await emit_stage_timings_log(
                 path="openai_responses_ws",
                 request_id=request_id,
@@ -2387,6 +5041,31 @@ class OpenAIHandlerMixin:
         http_headers = dict(upstream_headers)
         http_headers["content-type"] = "application/json"
 
+        # Byte-faithful re-serialization (PR-A3, fixes P0-2). The WS payload
+        # is always synthesized from the WebSocket frame so the body is
+        # treated as mutated; we still go through the canonical path so
+        # numeric precision and UTF-8 are preserved.
+        from headroom.proxy.helpers import (
+            log_outbound_request,
+            prepare_outbound_body_bytes,
+        )
+
+        outbound_bytes, outbound_source = prepare_outbound_body_bytes(
+            body=http_body,
+            original_body_bytes=None,
+            body_mutated=True,
+        )
+        log_outbound_request(
+            forwarder="openai_ws",
+            method="POST",
+            path=http_url,
+            body_bytes_count=len(outbound_bytes),
+            body_mutated=True,
+            mutation_reasons=["ws_http_fallback_resynthesized"],
+            request_id=request_id,
+            source=outbound_source,
+        )
+
         logger.debug(f"[{request_id}] WS→HTTP fallback POST to {http_url}")
 
         try:
@@ -2397,7 +5076,7 @@ class OpenAIHandlerMixin:
                         "POST",
                         http_url,
                         headers=http_headers,
-                        json=http_body,
+                        content=outbound_bytes,
                         timeout=120.0,
                     ) as response:
                         if response.status_code != 200:
@@ -2406,7 +5085,9 @@ class OpenAIHandlerMixin:
                                 error_body += chunk
                                 if len(error_body) > 2000:
                                     break
-                            error_text = error_body.decode("utf-8", errors="replace")
+                            from headroom.proxy.helpers import safe_decode_for_logging
+
+                            error_text = safe_decode_for_logging(error_body)
                             logger.error(
                                 f"[{request_id}] WS→HTTP fallback got {response.status_code}: "
                                 f"{error_text[:500]}"
@@ -2654,33 +5335,76 @@ class OpenAIHandlerMixin:
         headers = dict(request.headers.items())
         headers.pop("host", None)
         headers.pop("accept-encoding", None)
+        client = classify_client(headers)
+        tags = extract_tags(headers)
+        # PR-A5 (P5-49): strip internal x-headroom-* before forwarding upstream.
+        from headroom.proxy.helpers import _strip_internal_headers, log_outbound_headers
+
+        _pre_strip_count_pt = sum(1 for k in headers if k.lower().startswith("x-headroom-"))
+        headers = _strip_internal_headers(headers)
+        log_outbound_headers(
+            forwarder="openai_passthrough",
+            stripped_count=_pre_strip_count_pt,
+            request_id=None,
+        )
 
         body = await request.body()
 
         headers = await apply_copilot_api_auth(headers, url=url)
-        response = await self.http_client.request(  # type: ignore[union-attr]
-            method=request.method,
-            url=url,
-            headers=headers,
-            content=body,
-        )
+        try:
+            response = await self.http_client.request(  # type: ignore[union-attr]
+                method=request.method,
+                url=url,
+                headers=headers,
+                content=body,
+            )
+        except (httpx.ConnectError, httpx.TimeoutException) as e:
+            logger.warning(
+                "Passthrough request failed before upstream response: %s %s -> %s: %s",
+                request.method,
+                path,
+                url,
+                e,
+            )
+            return Response(
+                content=json.dumps(
+                    {
+                        "error": {
+                            "type": "connection_error",
+                            "message": f"Failed to connect to upstream API: {e}",
+                        }
+                    }
+                ),
+                status_code=502,
+                media_type="application/json",
+            )
 
         # Remove compression headers since httpx already decompressed the response
         response_headers = dict(response.headers)
         response_headers.pop("content-encoding", None)
         response_headers.pop("content-length", None)  # Length changed after decompression
 
-        # Track stats for passthrough requests
+        # Passthrough request: forwarded upstream with no transforms.
+        # Still recorded so dashboards see traffic on the passthrough
+        # endpoints. Funnel handles the "no tokens, no cache" shape
+        # via zero defaults.
         if endpoint_name and provider:
             latency_ms = (time.time() - start_time) * 1000
-            await self.metrics.record_request(
-                provider=provider,
-                model=f"passthrough:{endpoint_name}",
-                input_tokens=0,
-                output_tokens=0,
-                tokens_saved=0,
-                latency_ms=latency_ms,
-                cached=False,
+            request_id = await self._next_request_id()
+            await self._record_request_outcome(
+                RequestOutcome(
+                    request_id=request_id,
+                    provider=provider,
+                    model=f"passthrough:{endpoint_name}",
+                    original_tokens=0,
+                    optimized_tokens=0,
+                    output_tokens=0,
+                    tokens_saved=0,
+                    attempted_input_tokens=0,
+                    total_latency_ms=latency_ms,
+                    tags=tags,
+                    client=client,
+                )
             )
 
         return Response(
@@ -2688,59 +5412,3 @@ class OpenAIHandlerMixin:
             status_code=response.status_code,
             headers=response_headers,
         )
-
-    async def handle_databricks_invocations(
-        self,
-        request: Request,
-        model: str,
-    ) -> Response | StreamingResponse:
-        """Handle Databricks native /serving-endpoints/{model}/invocations endpoint.
-
-        This enables using the Databricks CLI directly with Headroom:
-            databricks serving-endpoints query <model> --profile HEADROOM --json '{"messages": [...]}'
-
-        The request/response format is identical to OpenAI chat completions,
-        so we inject the model from the path and delegate to handle_openai_chat.
-        """
-        from fastapi.responses import JSONResponse
-
-        from headroom.proxy.helpers import _read_request_json
-
-        request_id = await self._next_request_id()
-
-        try:
-            body = await _read_request_json(request)
-        except Exception as e:
-            logger.error(f"[{request_id}] Failed to parse Databricks request body: {e}")
-            return JSONResponse(
-                status_code=400,
-                content={
-                    "error": {
-                        "message": f"Invalid JSON: {e}",
-                        "type": "invalid_request_error",
-                    }
-                },
-            )
-
-        # Inject model from path into body (Databricks CLI passes model in URL, not body)
-        body["model"] = model
-
-        logger.info(f"[{request_id}] Databricks invocation: model={model}")
-
-        # Create a new request with the modified body
-        # We reuse the OpenAI chat handler since the format is identical
-        from starlette.requests import Request as StarletteRequest
-
-        # Build new scope with the body already parsed
-        scope = dict(request.scope)
-
-        # Create a simple receive function that returns our modified body
-        body_bytes = json.dumps(body).encode()
-
-        async def receive():
-            return {"type": "http.request", "body": body_bytes}
-
-        modified_request = StarletteRequest(scope, receive)
-
-        # Delegate to the OpenAI chat handler (same format)
-        return await self.handle_openai_chat(modified_request)

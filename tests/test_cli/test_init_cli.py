@@ -45,14 +45,110 @@ def test_init_auto_detects_targets(monkeypatch) -> None:
 
 
 def test_init_fails_when_auto_detection_empty(monkeypatch) -> None:
+    """Bare ``headroom init`` with no agents on PATH prints a guided error.
+
+    Regression guard for issue #245: the error must list every target that
+    was probed, confirm that -g / --global is a valid flag, and show the
+    explicit per-target invocation so the user knows how to proceed.
+    """
+
     init_cli, fake_main = _load_init_module(monkeypatch)
     runner = CliRunner()
-    monkeypatch.setattr(init_cli, "detect_init_targets", lambda global_scope: [])
+    monkeypatch.setattr(init_cli.shutil, "which", lambda name: None)
 
-    result = runner.invoke(fake_main, ["init"])
+    result = runner.invoke(fake_main, ["init", "-g"])
 
     assert result.exit_code != 0
-    assert "auto-detected" in result.output
+    assert "No supported user-scope agents were found on PATH" in result.output
+    assert "probed the following agents" in result.output
+    # Every in-scope target is listed with its lookup status.
+    for target in ("claude", "codex", "copilot", "openclaw"):
+        assert target in result.output
+    # The user is told that -g is still valid and given a concrete next step.
+    assert "-g" in result.output
+    assert "headroom init -g claude" in result.output
+
+
+def test_format_empty_detection_error_local_scope(monkeypatch) -> None:
+    """Local-scope variant of the guided error only lists local-scope agents."""
+
+    init_cli, _ = _load_init_module(monkeypatch)
+    monkeypatch.setattr(init_cli.shutil, "which", lambda name: None)
+
+    message = init_cli._format_empty_detection_error(global_scope=False)
+
+    assert "local-scope agents" in message
+    assert "claude" in message and "codex" in message
+    # Copilot / openclaw are global-only; must not be suggested for local.
+    assert "headroom init copilot" not in message
+    assert "headroom init openclaw" not in message
+    assert "headroom init claude" in message
+    assert "headroom init codex" in message
+
+
+def test_format_empty_detection_error_reports_found_paths(monkeypatch, tmp_path) -> None:
+    """When a binary IS present, the error still surfaces its path for debugging."""
+
+    init_cli, _ = _load_init_module(monkeypatch)
+    fake_claude = tmp_path / "claude"
+    fake_claude.write_text("")
+    monkeypatch.setattr(
+        init_cli.shutil,
+        "which",
+        lambda name: str(fake_claude) if name == "claude" else None,
+    )
+
+    message = init_cli._format_empty_detection_error(global_scope=True)
+
+    assert f"claude: found at {fake_claude}" in message
+    assert "codex: not found" in message
+
+
+def test_init_verbose_enables_debug_logging_on_stderr(monkeypatch) -> None:
+    """``headroom init -v`` should emit diagnostic lines to stderr.
+
+    Different Click 8.x versions expose stderr on ``CliRunner`` results
+    differently (``mix_stderr`` was removed in 8.2, and ``result.stderr``
+    appeared around the same time). To stay compatible with any Click 8.x
+    the repo targets, the test reads ``result.stderr`` when the attribute
+    exists AND contains data, otherwise falls back to ``result.output``
+    (which is the combined stream when stderr isn't captured separately).
+    """
+
+    init_cli, fake_main = _load_init_module(monkeypatch)
+    monkeypatch.setattr(init_cli.shutil, "which", lambda name: None)
+    runner = CliRunner()
+
+    result = runner.invoke(fake_main, ["init", "-v", "-g"])
+
+    # Newer Click: stderr captured separately.
+    stderr = getattr(result, "stderr", None) or ""
+    if not stderr:
+        # Older Click: everything in result.output.
+        stderr = result.output
+
+    assert result.exit_code != 0, f"output: {result.output!r}"
+    assert "[headroom init]" in stderr
+    assert "detect_init_targets" in stderr
+    assert "global_scope=True" in stderr
+    for target in ("claude", "codex", "copilot", "openclaw"):
+        assert target in stderr
+
+
+def test_init_verbose_is_idempotent(monkeypatch) -> None:
+    """Calling _enable_verbose_logging repeatedly keeps one handler attached."""
+
+    init_cli, _ = _load_init_module(monkeypatch)
+    # Clear any prior handler state on the dedicated init logger.
+    init_cli.logger.handlers.clear()
+    if hasattr(init_cli.logger, init_cli._VERBOSE_HANDLER_ATTR):
+        delattr(init_cli.logger, init_cli._VERBOSE_HANDLER_ATTR)
+
+    init_cli._enable_verbose_logging()
+    init_cli._enable_verbose_logging()
+    init_cli._enable_verbose_logging()
+
+    assert len(init_cli.logger.handlers) == 1
 
 
 def test_init_copilot_requires_global(monkeypatch) -> None:
@@ -107,6 +203,7 @@ def test_init_codex_merges_feature_flag_into_existing_table(monkeypatch, tmp_pat
     assert 'base_url = "http://127.0.0.1:9000/v1"' in content
     assert content.count("[features]") == 1
     assert "codex_hooks = true" in content
+    assert 'env_key = "OPENAI_API_KEY"' not in content
     hooks = json.loads((tmp_path / ".codex" / "hooks.json").read_text(encoding="utf-8"))
     assert "--profile init-local-demo" in hooks["hooks"]["SessionStart"][0]["hooks"][0]["command"]
     assert "init hook ensure" in hooks["hooks"]["SessionStart"][0]["hooks"][0]["command"]
@@ -340,6 +437,7 @@ def test_ensure_codex_provider_replaces_existing_marker(monkeypatch, tmp_path: P
     assert content.count(init_cli._CODEX_PROVIDER_MARKER_START) == 1
     assert 'base_url = "http://127.0.0.1:9100/v1"' in content
     assert "old = true" not in content
+    assert 'env_key = "OPENAI_API_KEY"' not in content
 
 
 def test_ensure_codex_feature_flag_replaces_existing_marker(monkeypatch, tmp_path: Path) -> None:
@@ -827,3 +925,70 @@ def test_init_hook_ensure_uses_explicit_profile(monkeypatch) -> None:
 
     assert result.exit_code == 0, result.output
     assert ensured == ["init-explicit"]
+
+
+# ---------------------------------------------------------------------------
+# Bug 3 (#406): _ensure_codex_provider must inject openai_base_url
+# ---------------------------------------------------------------------------
+
+
+def test_init_codex_writes_openai_base_url(monkeypatch, tmp_path: Path) -> None:
+    """_ensure_codex_provider must write openai_base_url at the top level so that
+    subscription (ChatGPT plan) users are routed through headroom even when the
+    init entry point is used instead of wrap."""
+    init_cli, _ = _load_init_module(monkeypatch)
+    path = tmp_path / ".codex" / "config.toml"
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    init_cli._ensure_codex_provider(path, 8787)
+
+    content = path.read_text(encoding="utf-8")
+    assert 'openai_base_url = "http://127.0.0.1:8787/v1"' in content, (
+        f"openai_base_url missing from init codex config:\n{content}"
+    )
+    # Must NOT appear inside a [section] block.
+    lines = content.splitlines()
+    in_section = False
+    for line in lines:
+        stripped = line.strip()
+        if stripped.startswith("["):
+            in_section = True
+        if in_section and stripped.startswith("openai_base_url"):
+            raise AssertionError(
+                f"openai_base_url appeared inside a section block in init output:\n{content}"
+            )
+    # Bug 3 regression guard.
+    assert "requires_openai_auth" not in content, (
+        f"requires_openai_auth must not appear in init codex config:\n{content}"
+    )
+
+
+def test_init_codex_strip_removes_openai_base_url(monkeypatch, tmp_path: Path) -> None:
+    """_strip_codex_init_block must remove both the managed block and any orphaned
+    openai_base_url lines left by a crashed or partial init."""
+    init_cli, _ = _load_init_module(monkeypatch)
+
+    # Normal install-then-strip cycle.
+    path = tmp_path / "config.toml"
+    path.write_text('model = "gpt-4o"\n', encoding="utf-8")
+    init_cli._ensure_codex_provider(path, 8787)
+    assert 'openai_base_url = "http://127.0.0.1:8787/v1"' in path.read_text(encoding="utf-8")
+
+    stripped = init_cli._strip_codex_init_block(path.read_text(encoding="utf-8"))
+    assert "openai_base_url" not in stripped, (
+        f"_strip_codex_init_block must remove openai_base_url after install:\n{stripped}"
+    )
+    assert "requires_openai_auth" not in stripped
+    assert 'model = "gpt-4o"' in stripped
+
+    # Orphan-cleanup path: openai_base_url left outside marker block.
+    orphan_content = (
+        'model = "gpt-4o"\n'
+        'openai_base_url = "http://127.0.0.1:8787/v1"\n'
+        'model_provider = "headroom"\n'
+    )
+    orphan_stripped = init_cli._strip_codex_init_block(orphan_content)
+    assert "openai_base_url" not in orphan_stripped, (
+        f"_strip_codex_init_block must remove orphaned openai_base_url:\n{orphan_stripped}"
+    )
+    assert 'model = "gpt-4o"' in orphan_stripped

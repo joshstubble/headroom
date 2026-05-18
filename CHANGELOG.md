@@ -8,12 +8,74 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- **PyPI install clarity and release gating.** Documented `pipx --python python3.13`
+  for environments where unsupported Python wheel tags cause older-version
+  resolution, made PyPI publish failures block GitHub Releases unless
+  `PYPI_SKIP=true`, and added an sdist `LICENSE` invariant.
+
+- **`Learned: error recovery` section in MEMORY.md no longer bloats with
+  stale, one-shot, or contradictory entries.** The matchers paired up
+  unrelated tool calls (e.g. `state.rs` and `lib.rs` in the same dir
+  becoming `File state.rs does not exist. The correct path is lib.rs.`),
+  the dedup key was the literal rendered bullet text so near-duplicates
+  each created their own row, the shutdown flush dropped the evidence
+  gate to 1 so every singleton landed at session end, and there was no
+  TTL or re-validation. Fixed at every layer:
+  (1) **Emission**: Read recoveries require the failed/successful
+  basenames to be identical or close in edit distance; Bash recoveries
+  require a shared binary (allowing `python`↔`python3` and
+  `ruff`↔`.venv/bin/ruff` variants) plus low-edit-distance OR a shared
+  substantive non-flag token. Unrelated pairs are rejected at the source.
+  (2) **Dedup**: error-recovery rows are hashed on recovery intent —
+  Read on `(basename(error_path), basename(success_path))`, Bash on the
+  primary command stripped of volatile suffixes (`| tail -N`, `2>&1`,
+  etc.). Near-duplicates collapse into one row.
+  (3) **Evidence gating**: default `min_evidence` raised from 2 to 5;
+  shutdown-relaxation removed; new `--min-evidence` flag and
+  `HEADROOM_MIN_EVIDENCE` envvar so embedded clients can tighten the
+  threshold further.
+  (4) **Render-time refinement**: drop rows not re-observed in 21 days,
+  re-validate Read success paths against the filesystem, collapse
+  same-error_path-with-multiple-targets into one "use Glob/Grep first"
+  bullet, rank by `evidence_count * 0.5 ** (days/5)`, cap the section
+  at 15. A→B / B→A contradiction pairs are also dropped at flush time.
+  Patterns now stamp `first_seen_at` / `last_seen_at` on every save;
+  `_bump_persisted_evidence` updates them via `json_set`. Other
+  `Learned: …` categories (environment, preference, architecture) are
+  untouched.
+- **`headroom unwrap codex` now actually undoes `headroom wrap codex`** —
+  previously there was no `unwrap codex` subcommand at all, so the injected
+  `model_provider = "headroom"` / `[model_providers.headroom]` block stayed
+  in `~/.codex/config.toml` forever and Codex continued routing through the
+  (potentially stopped) proxy, surfacing as `Missing environment variable:
+  OPENAI_API_KEY`. `wrap codex` now snapshots the pre-wrap
+  `config.toml` to `config.toml.headroom-backup` before its first injection,
+  and `unwrap codex` restores that snapshot byte-for-byte (or, if the
+  backup is missing, strips only the Headroom-managed block and leaves
+  surrounding user content intact). Safe no-op when run without a prior
+  wrap. Reported by @raenaryl in Discord.
+- **Image compressors now release shared router models after use and proxy shutdown** —
+  the proxy/image compression path no longer keeps global `technique-router`
+  and `SigLIP` model instances pinned in memory after one-off image
+  optimization work. The `get_compressor()` helper now returns a fresh,
+  caller-owned compressor instead of a process-lifetime singleton.
 - **`headroom learn` no longer clobbers prior recommendations on re-run** —
   the marker block in `CLAUDE.md` / `MEMORY.md` is now merged with the
   prior block instead of wholesale-replaced. Sections re-surfaced by the
   new run win; sections not re-surfaced are carried forward so learnings
   accumulate across runs instead of disappearing. To fully rebuild the
   block, delete it manually and re-run. (#231)
+- **`headroom learn` no longer emits dangling cross-references when a
+  section is re-surfaced** — the analyzer now includes the project's
+  current `<!-- headroom:learn -->` block (from `CLAUDE.md` and
+  `MEMORY.md`) in the LLM digest as a "Prior Learned Patterns" section,
+  and the system prompt instructs the LLM that re-emitting a section
+  replaces the prior one wholesale. Prevents bullets like "`X` is *also*
+  large — same rule as `Y`, `Z`" from appearing after `Y` and `Z` got
+  dropped during per-section replacement. The writer's section-level
+  carry-forward from #231 remains in place as a safety net for sections
+  the LLM omits entirely. New helper `extract_marker_block` added to
+  `headroom.learn.writer`.
 
 ### Added
 - **`turn_id` linking agent-loop API calls to a single user prompt** — a new
@@ -59,6 +121,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   LIKE on the raw JSON string, so rows survive metadata rewrites.
 
 ### Added
+- **`HEADROOM_QDRANT_*` environment variables for memory Qdrant configuration**
+  (#31) — `Memory(backend="qdrant-neo4j")`, `Mem0Config`, `MemoryConfig`, and
+  `ProxyConfig` now resolve their Qdrant connection from
+  `HEADROOM_QDRANT_URL`, `HEADROOM_QDRANT_HOST`, `HEADROOM_QDRANT_PORT`,
+  `HEADROOM_QDRANT_API_KEY`, `HEADROOM_QDRANT_HTTPS`,
+  `HEADROOM_QDRANT_PREFER_GRPC`, and `HEADROOM_QDRANT_GRPC_PORT`. Explicit
+  constructor arguments still win; unset env keeps the existing
+  `localhost:6333` defaults. Adds matching `--memory-qdrant-{url,host,port,api-key}`
+  CLI flags. Enables hosted Qdrant (Qdrant Cloud) and shared/remote Qdrant
+  stacks without code changes. New helper:
+  [`headroom/memory/qdrant_env.py`](headroom/memory/qdrant_env.py).
 - **Telemetry stack & install-mode identity fields** — anonymous beacon now
   reports `headroom_stack` (how Headroom is invoked: `proxy`, `wrap_claude`,
   `adapter_ts_openai`, ...) and `install_mode` (`wrapped` / `persistent` /

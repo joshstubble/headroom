@@ -2,13 +2,40 @@
 
 import os
 import sys
+from typing import Any, Literal, cast
 
 import click
 
+from headroom import paths as _paths
 from headroom.providers.registry import resolve_api_overrides, resolve_api_targets
 from headroom.proxy.modes import PROXY_MODE_TOKEN, normalize_proxy_mode
 
 from .main import main
+
+_CONTEXT_TOOL_ENV = "HEADROOM_CONTEXT_TOOL"
+_CONTEXT_TOOL_RTK = "rtk"
+_CONTEXT_TOOL_LEAN_CTX = "lean-ctx"
+_VALID_CONTEXT_TOOLS = {_CONTEXT_TOOL_RTK, _CONTEXT_TOOL_LEAN_CTX}
+
+
+def _get_env_bool(name: str, default: bool) -> bool:
+    val = os.environ.get(name)
+    if val is None:
+        return default
+    return val.lower() in ("true", "1", "yes", "on")
+
+
+def _selected_context_tool() -> str:
+    raw = os.environ.get(_CONTEXT_TOOL_ENV, "").strip().lower().replace("_", "-")
+    if not raw:
+        return _CONTEXT_TOOL_RTK
+    if raw == "leanctx":
+        raw = _CONTEXT_TOOL_LEAN_CTX
+    if raw not in _VALID_CONTEXT_TOOLS:
+        raise click.ClickException(
+            f"{_CONTEXT_TOOL_ENV} must be one of: {', '.join(sorted(_VALID_CONTEXT_TOOLS))}"
+        )
+    return raw
 
 
 @main.command()
@@ -27,9 +54,45 @@ from .main import main
     help="Port to bind to (default: 8787, env: HEADROOM_PORT)",
 )
 @click.option(
+    "--workers",
+    default=1,
+    type=click.IntRange(min=1),
+    envvar="HEADROOM_WORKERS",
+    help="Number of Uvicorn worker processes (default: 1, env: HEADROOM_WORKERS)",
+)
+@click.option(
+    "--limit-concurrency",
+    default=1000,
+    type=click.IntRange(min=1),
+    envvar="HEADROOM_LIMIT_CONCURRENCY",
+    help=(
+        "Maximum concurrent connections before Uvicorn returns 503 "
+        "(default: 1000, env: HEADROOM_LIMIT_CONCURRENCY)"
+    ),
+)
+@click.option(
+    "--max-connections",
+    default=500,
+    type=click.IntRange(min=1),
+    envvar="HEADROOM_MAX_CONNECTIONS",
+    help="Maximum upstream HTTP connections (default: 500, env: HEADROOM_MAX_CONNECTIONS)",
+)
+@click.option(
+    "--max-keepalive",
+    "max_keepalive_connections",
+    default=100,
+    type=click.IntRange(min=0),
+    envvar="HEADROOM_MAX_KEEPALIVE",
+    help="Maximum upstream keep-alive connections (default: 100, env: HEADROOM_MAX_KEEPALIVE)",
+)
+@click.option(
     "--mode",
     default=None,
+    metavar="[token|cache]",
     type=click.Choice(
+        # Canonical modes first; legacy aliases follow for backward compatibility.
+        # `metavar` above hides the alias clutter from --help; users see "[token|cache]"
+        # while internal callers passing "token_mode"/"cost_savings"/etc. still validate.
         [
             "token",
             "cache",
@@ -38,12 +101,15 @@ from .main import main
             "token_savings",
             "cost_savings",
             "token_headroom",
-        ]
+        ],
+        case_sensitive=False,
     ),
     help=(
-        "Optimization mode: token (prioritize compression) or cache "
-        "(freeze prior turns for prefix-cache stability). "
-        "Legacy aliases are accepted. Default: token. Env: HEADROOM_MODE"
+        "Optimization mode (default: token).\n"
+        "  token  — prioritize compression; prior turns may be rewritten for max savings.\n"
+        "  cache  — freeze prior turns to maximise provider prefix-cache hit rate.\n"
+        "Legacy aliases (token_mode, token_savings, token_headroom, cache_mode, "
+        "cost_savings) are still accepted. Env: HEADROOM_MODE."
     ),
 )
 @click.option(
@@ -57,6 +123,17 @@ from .main import main
 @click.option("--no-optimize", is_flag=True, help="Disable optimization (passthrough mode)")
 @click.option("--no-cache", is_flag=True, help="Disable semantic caching")
 @click.option("--no-rate-limit", is_flag=True, help="Disable rate limiting")
+@click.option(
+    "--proxy-extension",
+    "proxy_extension",
+    multiple=True,
+    envvar="HEADROOM_PROXY_EXTENSIONS",
+    help=(
+        "Enable a registered proxy extension by entry-point name (opt-in). "
+        "Repeat the flag or pass a comma-separated list. Use '*' to enable "
+        "every discovered extension. Env: HEADROOM_PROXY_EXTENSIONS."
+    ),
+)
 @click.option(
     "--no-subscription-tracking",
     is_flag=True,
@@ -134,17 +211,51 @@ from .main import main
     help="Enable full message logging (request/response content stored for live feed)",
 )
 @click.option(
+    "--codex-wire-debug",
+    is_flag=True,
+    help="Enable local Codex wire snapshots and matching proxy.log frame traces.",
+)
+@click.option(
+    "--codex-wire-debug-dir",
+    default=None,
+    help=(
+        "Directory for Codex wire snapshots (default: "
+        "~/.headroom/logs/codex_wire or workspace .headroom/logs/codex_wire)."
+    ),
+)
+@click.option(
     "--budget",
     type=float,
     default=None,
     envvar="HEADROOM_BUDGET",
     help="Daily budget limit in USD (env: HEADROOM_BUDGET)",
 )
-# Code graph: indexes project + watches files for live reindex via codebase-memory-mcp
+# Code-aware compression (AST-based, requires `pip install headroom-ai[code]`).
+# Pair of flags so users can override the env-var default in either direction.
+# We resolve HEADROOM_CODE_AWARE_ENABLED in the body (not via Click's envvar=),
+# because Click's envvar handling for paired bool flags is brittle in older
+# Click versions.
+@click.option(
+    "--code-aware/--no-code-aware",
+    "code_aware_flag",
+    default=None,
+    help=(
+        "Enable/disable AST-based code compression. Requires the optional "
+        "tree-sitter dependency: pip install headroom-ai[code]. "
+        "Default: disabled. Env: HEADROOM_CODE_AWARE_ENABLED=1 to enable."
+    ),
+)
+# Code graph: indexes project + watches files for live reindex via codebase-memory-mcp.
+# Only useful when the proxy is launched from a project root — it indexes the
+# current working directory.
 @click.option(
     "--code-graph",
     is_flag=True,
-    help="Enable code graph intelligence (indexes project, watches files for live reindex via codebase-memory-mcp)",
+    help=(
+        "Enable code graph intelligence: indexes the current working directory "
+        "and watches files for live reindex via codebase-memory-mcp. Only useful "
+        "when the proxy is launched from a project root."
+    ),
 )
 # Read lifecycle (ON by default: compresses stale/superseded Read outputs)
 @click.option(
@@ -152,33 +263,48 @@ from .main import main
     is_flag=True,
     help="Disable Read lifecycle management (stale/superseded Read compression)",
 )
-# Intelligent Context Management (ON by default)
-@click.option(
-    "--no-intelligent-context",
-    is_flag=True,
-    help="Disable IntelligentContextManager (fall back to RollingWindow)",
-)
-@click.option(
-    "--no-intelligent-scoring",
-    is_flag=True,
-    help="Disable multi-factor importance scoring (use position-based)",
-)
-@click.option(
-    "--no-compress-first",
-    is_flag=True,
-    help="Disable trying deeper compression before dropping messages",
-)
 # Memory System (Multi-Provider Support)
 @click.option(
     "--memory",
     is_flag=True,
-    help="Enable persistent user memory. Auto-detects provider and uses appropriate tool format. "
-    "Set x-headroom-user-id header for per-user memory (defaults to 'default').",
+    help=(
+        "Enable persistent memory. Auto-detects provider and uses appropriate tool format. "
+        "By default (--memory-storage=project) each workspace gets its own DB so memories "
+        "from unrelated projects can never bleed in (GH #462). Override scoping with "
+        "x-headroom-user-id and/or x-headroom-project-id / x-headroom-cwd request headers."
+    ),
 )
 @click.option(
     "--memory-db-path",
     default="",
-    help="Path to memory database file (default: {cwd}/.headroom/memory.db)",
+    help=(
+        "Path to the legacy single-file memory DB (used in --memory-storage=global, "
+        "and as the seed for the project-mode storage root). "
+        "Default: {cwd}/.headroom/memory.db"
+    ),
+)
+@click.option(
+    "--memory-storage",
+    type=click.Choice(["project", "user", "global"], case_sensitive=False),
+    default="project",
+    show_default=True,
+    help=(
+        "Memory partitioning strategy. project (default): one SQLite DB per resolved "
+        "workspace under <db_path_dir>/memories/projects/<basename>-<hash>/memory.db — "
+        "no cross-project bleed. user: one DB per x-headroom-user-id. global: a single "
+        "shared DB (pre-fix behaviour; --memory-db-path file is reused so existing "
+        "memories remain reachable)."
+    ),
+)
+@click.option(
+    "--memory-project-root",
+    default="",
+    help=(
+        "Override the project root used for --memory-storage=project. Useful when the "
+        "client doesn't put a cwd in the system prompt or you want to force a specific "
+        "workspace. Takes effect after the x-headroom-project-id and x-headroom-cwd "
+        "headers."
+    ),
 )
 @click.option("--no-memory-tools", is_flag=True, help="Disable automatic memory tool injection")
 @click.option(
@@ -189,6 +315,37 @@ from .main import main
     type=int,
     default=10,
     help="Number of memories to inject as context (default: 10)",
+)
+@click.option(
+    "--memory-qdrant-url",
+    default=None,
+    help=(
+        "Full Qdrant URL for the qdrant-neo4j backend "
+        "(e.g. https://xyz.cloud.qdrant.io:6333). When set, takes precedence over "
+        "--memory-qdrant-host/--memory-qdrant-port. "
+        "Also reads HEADROOM_QDRANT_URL."
+    ),
+)
+@click.option(
+    "--memory-qdrant-host",
+    default=None,
+    help=(
+        "Qdrant host for the qdrant-neo4j backend "
+        "(default: localhost, also reads HEADROOM_QDRANT_HOST)"
+    ),
+)
+@click.option(
+    "--memory-qdrant-port",
+    type=int,
+    default=None,
+    help=(
+        "Qdrant port for the qdrant-neo4j backend (default: 6333, also reads HEADROOM_QDRANT_PORT)"
+    ),
+)
+@click.option(
+    "--memory-qdrant-api-key",
+    default=None,
+    help=("API key for hosted Qdrant (e.g. Qdrant Cloud). Also reads HEADROOM_QDRANT_API_KEY."),
 )
 # Traffic Learning (live pattern extraction from proxy traffic)
 @click.option(
@@ -202,6 +359,17 @@ from .main import main
     "--no-learn",
     is_flag=True,
     help="Explicitly disable traffic learning even when --memory is set.",
+)
+@click.option(
+    "--min-evidence",
+    type=int,
+    default=None,
+    envvar="HEADROOM_MIN_EVIDENCE",
+    help=(
+        "Minimum number of times a pattern must be observed before it is "
+        "persisted to memory. Higher values reduce one-shot noise at the "
+        "cost of slower learning. Default: 5. (env: HEADROOM_MIN_EVIDENCE)"
+    ),
 )
 # Backend configuration
 @click.option(
@@ -270,10 +438,15 @@ def proxy(
     mode: str | None,
     host: str,
     port: int,
+    workers: int,
+    limit_concurrency: int,
+    max_connections: int,
+    max_keepalive_connections: int,
     intercept_tool_results: bool,
     no_optimize: bool,
     no_cache: bool,
     no_rate_limit: bool,
+    proxy_extension: tuple[str, ...],
     no_subscription_tracking: bool,
     subscription_poll_interval: int | None,
     retry_max_attempts: int | None,
@@ -283,19 +456,26 @@ def proxy(
     anthropic_pre_upstream_memory_context_timeout_seconds: float | None,
     log_file: str | None,
     log_messages: bool,
+    codex_wire_debug: bool,
+    codex_wire_debug_dir: str | None,
     budget: float | None,
+    code_aware_flag: bool | None,
     code_graph: bool,
     no_read_lifecycle: bool,
-    no_intelligent_context: bool,
-    no_intelligent_scoring: bool,
-    no_compress_first: bool,
     memory: bool,
     memory_db_path: str,
+    memory_storage: str,
+    memory_project_root: str,
     no_memory_tools: bool,
     no_memory_context: bool,
     memory_top_k: int,
+    memory_qdrant_url: str | None,
+    memory_qdrant_host: str | None,
+    memory_qdrant_port: int | None,
+    memory_qdrant_api_key: str | None,
     learn: bool,
     no_learn: bool,
+    min_evidence: int | None,
     backend: str,
     anyllm_provider: str,
     anthropic_api_url: str | None,
@@ -385,12 +565,31 @@ def proxy(
     if no_telemetry:
         os.environ["HEADROOM_TELEMETRY"] = "off"
 
+    if codex_wire_debug or codex_wire_debug_dir:
+        os.environ["HEADROOM_CODEX_WIRE_DEBUG"] = "1"
+        os.environ["HEADROOM_CODEX_WIRE_DEBUG_DIR"] = codex_wire_debug_dir or str(
+            _paths.codex_wire_debug_dir()
+        )
+
     # Stateless mode: suppress TOIN filesystem persistence
     if is_stateless:
         os.environ["HEADROOM_TOIN_BACKEND"] = "none"
 
     # License key for managed/enterprise deployments (optional)
     license_key = os.environ.get("HEADROOM_LICENSE_KEY")
+
+    # Qdrant connection for the qdrant-neo4j backend. CLI flags default
+    # to None; when omitted we let ProxyConfig's default_factory resolve
+    # HEADROOM_QDRANT_* env vars. Explicit CLI values win over env.
+    qdrant_overrides: dict[str, Any] = {}
+    if memory_qdrant_url is not None:
+        qdrant_overrides["memory_qdrant_url"] = memory_qdrant_url
+    if memory_qdrant_host is not None:
+        qdrant_overrides["memory_qdrant_host"] = memory_qdrant_host
+    if memory_qdrant_port is not None:
+        qdrant_overrides["memory_qdrant_port"] = memory_qdrant_port
+    if memory_qdrant_api_key is not None:
+        qdrant_overrides["memory_qdrant_api_key"] = memory_qdrant_api_key
 
     config = ProxyConfig(
         host=host,
@@ -403,6 +602,13 @@ def proxy(
         optimize=not no_optimize,
         cache_enabled=not no_cache,
         rate_limit_enabled=not no_rate_limit,
+        # Flatten repeat-flag tuple AND any comma-separated values inside it.
+        # `--proxy-extension a,b --proxy-extension c` and `HEADROOM_PROXY_EXTENSIONS=a,b,c`
+        # both yield ["a", "b", "c"]. None when nothing was supplied.
+        proxy_extensions=(
+            [part.strip() for chunk in proxy_extension for part in chunk.split(",") if part.strip()]
+            or None
+        ),
         subscription_tracking_enabled=not no_subscription_tracking,
         subscription_poll_interval_s=(
             subscription_poll_interval if subscription_poll_interval is not None else 300
@@ -411,30 +617,43 @@ def proxy(
         connect_timeout_seconds=connect_timeout_seconds
         if connect_timeout_seconds is not None
         else 10,
+        max_connections=max_connections,
+        max_keepalive_connections=max_keepalive_connections,
         log_file=None if is_stateless else log_file,
         log_full_messages=log_messages
         or os.environ.get("HEADROOM_LOG_MESSAGES", "").lower() in ("true", "1", "yes", "on"),
         budget_limit_usd=budget,
+        # Code-aware compression resolution:
+        # 1. Explicit --code-aware / --no-code-aware always wins.
+        # 2. Otherwise read HEADROOM_CODE_AWARE_ENABLED (truthy = on).
+        # 3. Otherwise default off — matches the prior cli/proxy.py behavior so
+        #    existing users see no change unless they opt in.
+        code_aware_enabled=(
+            bool(code_aware_flag)
+            if code_aware_flag is not None
+            else os.environ.get("HEADROOM_CODE_AWARE_ENABLED", "").strip().lower()
+            in ("true", "1", "yes", "on")
+        ),
         # Code graph: live file watcher for incremental reindexing
         code_graph_watcher=code_graph,
         # Read lifecycle: ON by default (use --no-read-lifecycle to disable)
         read_lifecycle=not no_read_lifecycle,
-        # Intelligent Context: ON by default (use --no-intelligent-context to disable)
-        intelligent_context=not no_intelligent_context,
-        intelligent_context_scoring=not no_intelligent_scoring,
-        intelligent_context_compress_first=not no_compress_first,
         # Memory System (Multi-Provider with auto-detection)
         # --learn implies --memory (need backend for storing patterns)
         # Stateless mode disables memory (requires SQLite on disk)
         memory_enabled=False if is_stateless else (memory or (learn and not no_learn)),
         memory_db_path=memory_db_path,
+        memory_storage_mode=cast(Literal["project", "user", "global"], memory_storage.lower()),
+        memory_project_root_override=memory_project_root,
         memory_inject_tools=not no_memory_tools,
         memory_inject_context=not no_memory_context,
         memory_top_k=memory_top_k,
+        **qdrant_overrides,
         # Traffic Learning: only with --learn, never with --no-learn
         # Stateless mode disables learning (requires filesystem)
         traffic_learning_enabled=False if is_stateless else (learn and not no_learn),
         traffic_learning_agent_type=os.environ.get("HEADROOM_AGENT_TYPE", "unknown"),
+        traffic_learning_min_evidence=min_evidence if min_evidence is not None else 5,
         # Backend (Anthropic direct, Bedrock, LiteLLM, or any-llm)
         backend=backend,
         bedrock_region=bedrock_region or region,
@@ -512,10 +731,10 @@ Memory (Multi-Provider):
   - Anthropic: Uses native memory tool (memory_20250818) - subscription safe
   - OpenAI/Gemini/Others: Uses function calling format
   - All providers share the same semantic vector store backend
-  - Set x-headroom-user-id header for per-user memory (defaults to 'default')
+  - Storage mode: {config.memory_storage_mode} (per-project DB by default — set x-headroom-project-id / x-headroom-cwd to override)
   - Tools: {"ENABLED" if config.memory_inject_tools else "DISABLED"}
   - Context injection: {"ENABLED" if config.memory_inject_context else "DISABLED"}
-  - Database: {config.memory_db_path}
+  - Database: {config.memory_db_path} (legacy / global-mode DB)
 """
 
     # Stateless mode warning
@@ -536,6 +755,41 @@ Memory (Multi-Provider):
     else:
         telemetry_line = "  Telemetry:    DISABLED"
 
+    # Discover proxy extensions (third-party packages registered via the
+    # `headroom.proxy_extension` entry-point group). Surfaced in the banner
+    # so operators can see what's available + what's currently opted-in.
+    # Discovery does NOT run extension code; only the explicitly-enabled
+    # set in config.proxy_extensions actually installs.
+    try:
+        from headroom.proxy.extensions import discover as _discover_extensions
+
+        _ext_available = sorted(name for name, _ in _discover_extensions())
+    except Exception:  # noqa: BLE001 — banner must never crash startup
+        _ext_available = []
+    _ext_enabled = config.proxy_extensions or []
+    if not _ext_available:
+        extensions_line = "  Extensions:   (none discovered)"
+    elif not _ext_enabled:
+        extensions_line = (
+            f"  Extensions:   discovered={','.join(_ext_available)} "
+            f"(opt-in: --proxy-extension <name> or HEADROOM_PROXY_EXTENSIONS=<n>)"
+        )
+    elif "*" in _ext_enabled:
+        extensions_line = f"  Extensions:   ENABLED (wildcard) {','.join(_ext_available)}"
+    else:
+        extensions_line = (
+            f"  Extensions:   ENABLED {','.join(sorted(_ext_enabled))} "
+            f"(available: {','.join(_ext_available)})"
+        )
+
+    # Code-aware status line — same logic the inner banner uses, surfaced here
+    # so the click-CLI banner is a complete picture (avoids the dual-banner
+    # confusion this branch retired).
+    from headroom.proxy.server import _get_code_aware_banner_status
+
+    code_aware_line = f"  Code-Aware:   {_get_code_aware_banner_status(config)}"
+    context_tool_line = f"  Context Tool: {_selected_context_tool()}"
+
     click.echo(f"""
 ╔═══════════════════════════════════════════════════════════════════════╗
 ║                         HEADROOM PROXY                                 ║
@@ -551,6 +805,9 @@ Starting proxy server...
   Rate Limit:   {"ENABLED" if config.rate_limit_enabled else "DISABLED"}
   Memory:       {memory_status}
   License:      {license_status}
+{code_aware_line}
+{context_tool_line}
+{extensions_line}
 {stateless_line}{telemetry_line}
 {backend_section}
 Routing:
@@ -575,6 +832,15 @@ Press Ctrl+C to stop.
 """)
 
     try:
-        run_server(config)
+        run_kwargs: dict[str, Any] = {}
+        if workers != 1:
+            run_kwargs["workers"] = workers
+        if limit_concurrency != 1000:
+            run_kwargs["limit_concurrency"] = limit_concurrency
+        # Suppress run_server's legacy banner — the click CLI already printed
+        # a richer one above. Direct `python -m headroom.proxy.server` keeps
+        # the legacy banner via run_server's default.
+        run_kwargs["print_banner"] = False
+        run_server(config, **run_kwargs)
     except KeyboardInterrupt:
         click.echo("\nShutting down...")

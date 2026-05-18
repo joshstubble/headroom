@@ -22,13 +22,15 @@ import asyncio
 import hashlib
 import json
 import logging
+import os
 import re
 import sqlite3
 import time
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, ClassVar
 
 if TYPE_CHECKING:
     from headroom.learn.models import ProjectInfo
@@ -44,6 +46,20 @@ FLUSH_DEBOUNCE_SECONDS = 10.0
 # Absolute file-path heuristic for anchoring a pattern to a project root.
 # Matches POSIX paths (starts with /) and common Windows drive paths.
 _ABS_PATH_RE = re.compile(r"(?:[A-Za-z]:[\\/]|/)[\w./\\\-]+")
+
+# Error-recovery refinement: the Learned: error recovery section is capped,
+# decayed, and re-validated at render time. Other categories are untouched.
+_ERROR_RECOVERY_SECTION_CAP = 15
+_ERROR_RECOVERY_HALF_LIFE_DAYS = 5.0
+_ERROR_RECOVERY_HARD_FLOOR_DAYS = 21
+
+# Suffixes that vary between otherwise-identical Bash recoveries. Stripping
+# them before hashing collapses near-duplicates.
+_BASH_VOLATILE_SUFFIX_RE = re.compile(
+    r"(?:\s*\|\s*(?:head|tail)\s+-n?\s*\d+"
+    r"|\s+-A\s*\d+|\s+-B\s*\d+|\s+-C\s*\d+"
+    r"|\s+2>&1|\s+2>/dev/null)+\s*$"
+)
 
 
 # =============================================================================
@@ -87,10 +103,60 @@ class ExtractedPattern:
     entity_refs: list[str] = field(default_factory=list)
     metadata: dict[str, Any] = field(default_factory=dict)
     content_hash: str = ""
+    first_seen_at: datetime | None = None
+    last_seen_at: datetime | None = None
 
     def __post_init__(self) -> None:
         if not self.content_hash:
-            self.content_hash = hashlib.sha256(self.content.encode()).hexdigest()[:16]
+            key = _normalize_hash_key(self.category, self.content, self.metadata)
+            self.content_hash = hashlib.sha256(key.encode()).hexdigest()[:16]
+
+
+def _normalize_hash_key(
+    category: PatternCategory,
+    content: str,
+    metadata: dict[str, Any],
+) -> str:
+    """Build the string that feeds the content hash.
+
+    Error-recovery rows are collapsed on recovery intent, not literal text:
+    trivial invocation differences (tail counts, pipe suffixes, full paths
+    that share a basename) hash to the same key. Other categories hash the
+    raw content for backwards compatibility.
+    """
+    if category is not PatternCategory.ERROR_RECOVERY:
+        return content
+
+    tool = metadata.get("tool")
+    if tool == "Read":
+        error_path = metadata.get("error_path", "")
+        success_path = metadata.get("success_path", "")
+        return (
+            f"error_recovery|Read|{os.path.basename(error_path)}|{os.path.basename(success_path)}"
+        )
+    if tool == "Bash":
+        failed = metadata.get("failed_cmd", "")
+        success = metadata.get("success_cmd", "")
+        return (
+            f"error_recovery|Bash|"
+            f"{_normalize_bash_for_hash(failed)}|{_normalize_bash_for_hash(success)}"
+        )
+    return content
+
+
+def _normalize_bash_for_hash(cmd: str) -> str:
+    """Strip volatile suffixes and truncate at the first pipe/chain boundary."""
+    if not cmd:
+        return ""
+    # Drop paging, line-context flags, and redirections that vary between runs.
+    trimmed = _BASH_VOLATILE_SUFFIX_RE.sub("", cmd).strip()
+    # Cut at the first pipe or && so we hash the primary command, not the tail.
+    for sep in (" | ", " && "):
+        idx = trimmed.find(sep)
+        if idx != -1:
+            trimmed = trimmed[:idx].rstrip()
+            break
+    return trimmed
 
 
 # =============================================================================
@@ -145,6 +211,180 @@ _MODULE_RE = re.compile(r"No module named ['\"]?(\w[\w.]*)['\"]?")
 _COMMAND_NF_RE = re.compile(r"(\w[\w-]*): command not found")
 
 
+def _levenshtein(a: str, b: str) -> int:
+    """Iterative Levenshtein distance. Pure Python, no deps.
+
+    Bounded use only — callers should keep input sizes reasonable
+    (basenames, command strings) to avoid O(n*m) blowups.
+    """
+    if a == b:
+        return 0
+    if not a:
+        return len(b)
+    if not b:
+        return len(a)
+    if len(a) > len(b):
+        a, b = b, a
+    prev = list(range(len(a) + 1))
+    for j, cb in enumerate(b, 1):
+        curr = [j] + [0] * len(a)
+        for i, ca in enumerate(a, 1):
+            cost = 0 if ca == cb else 1
+            curr[i] = min(curr[i - 1] + 1, prev[i] + 1, prev[i - 1] + cost)
+        prev = curr
+    return prev[-1]
+
+
+def _paths_related_as_typo(failed: str, success: str) -> bool:
+    """Heuristic: are these two file paths plausibly the same target?
+
+    Two paths are "related as typo recovery" if their basenames are
+    identical or close in edit distance. Different basenames in the same
+    directory (e.g. `state.rs` vs `lib.rs`) are NOT related — the matcher
+    must reject them, otherwise unrelated reads get paired into bogus
+    "File X does not exist, use Y" rules.
+    """
+    if not failed or not success or failed == success:
+        return False
+    a = failed.rsplit("/", 1)[-1].rsplit("\\", 1)[-1]
+    b = success.rsplit("/", 1)[-1].rsplit("\\", 1)[-1]
+    if not a or not b:
+        return False
+    if a == b:
+        return True
+    threshold = max(2, max(len(a), len(b)) // 3)
+    return _levenshtein(a, b) <= threshold
+
+
+# Tokens that occur in many unrelated commands and don't, by themselves,
+# suggest two commands are related retries.
+_COMMAND_NOISE_TOKENS = frozenset(
+    {
+        "head",
+        "tail",
+        "cat",
+        "grep",
+        "awk",
+        "sed",
+        "sort",
+        "uniq",
+        "wc",
+        "xargs",
+        "find",
+    }
+)
+
+
+def _bash_first_binary(cmd: str) -> str | None:
+    """Return the first binary name in a Bash command, or None.
+
+    Strips a leading `source <venv> && ` prefix and skips over `VAR=value`
+    environment-variable assignments before the binary. Used to gate
+    command-recovery pairing: if two commands don't share a binary, they
+    are not retries of each other.
+    """
+    s = cmd.strip()
+    m = re.match(r"source\s+\S+\s*&&\s*(.*)", s, re.I)
+    if m:
+        s = m.group(1)
+    for tok in s.split():
+        if "=" in tok and tok.split("=", 1)[0].replace("_", "").isalnum():
+            continue
+        return tok
+    return None
+
+
+def _bash_binaries_match(a: str, b: str) -> bool:
+    """Treat two binaries as 'the same tool' for recovery purposes.
+
+    Equal strings, basename equality (`ruff` vs `.venv/bin/ruff`), and
+    short prefix-style versions (`python` vs `python3`) all qualify.
+    Different tools (`grep` vs `find`) do not.
+    """
+    if a == b:
+        return True
+    a_base = a.rsplit("/", 1)[-1]
+    b_base = b.rsplit("/", 1)[-1]
+    if a_base == b_base:
+        return True
+    if (a_base.startswith(b_base) or b_base.startswith(a_base)) and _levenshtein(
+        a_base, b_base
+    ) <= 2:
+        return True
+    return False
+
+
+def _commands_related_as_retry(failed: str, success: str) -> bool:
+    """Heuristic: is `success` plausibly a corrected retry of `failed`?
+
+    Requires the same binary AND either:
+      - low normalized edit distance (≤40% of max length), OR
+      - at least one shared substantive token (length ≥ 5, not a flag,
+        not a generic shell verb).
+
+    The bar is conservative: noise like `grep <pattern A> <file A>` paired
+    with `grep <pattern B> <file B>` shares the `grep` binary but no real
+    arguments, and gets rejected. Genuine retries (extra flag, single
+    arg edit) pass via the edit-distance path.
+    """
+    if not failed or not success or failed == success:
+        return False
+    bin_a = _bash_first_binary(failed)
+    bin_b = _bash_first_binary(success)
+    if not bin_a or not bin_b or not _bash_binaries_match(bin_a, bin_b):
+        return False
+
+    max_len = max(len(failed), len(success))
+    if max_len > 0 and _levenshtein(failed, success) / max_len <= 0.40:
+        return True
+
+    def _substantive(cmd: str, binary: str) -> set[str]:
+        out: set[str] = set()
+        for tok in cmd.split():
+            if len(tok) < 5 or tok.startswith("-") or tok == binary:
+                continue
+            if tok.lower() in _COMMAND_NOISE_TOKENS:
+                continue
+            out.add(tok)
+        return out
+
+    return bool(_substantive(failed, bin_a) & _substantive(success, bin_b))
+
+
+_FILE_X_DOES_NOT_EXIST_RE = re.compile(
+    r"^File `([^`]+)` does not exist\. The correct path is `([^`]+)`\.$"
+)
+
+
+def _drop_contradictions(patterns: list[ExtractedPattern]) -> list[ExtractedPattern]:
+    """Remove A→B and B→A pairs from error_recovery patterns.
+
+    When the matcher emits a "File X does not exist, use Y" rule and the
+    inverse "File Y does not exist, use X" rule, both are likely the
+    result of opposite-direction typos rather than a stable truth. Drop
+    both rather than persisting contradictory advice.
+    """
+    forward: dict[tuple[str, str], int] = {}
+    for idx, p in enumerate(patterns):
+        if p.category != PatternCategory.ERROR_RECOVERY:
+            continue
+        m = _FILE_X_DOES_NOT_EXIST_RE.match(p.content)
+        if not m:
+            continue
+        forward[(m.group(1), m.group(2))] = idx
+
+    drop: set[int] = set()
+    for (a, b), idx_ab in forward.items():
+        idx_ba = forward.get((b, a))
+        if idx_ba is not None:
+            drop.add(idx_ab)
+            drop.add(idx_ba)
+
+    if not drop:
+        return patterns
+    return [p for i, p in enumerate(patterns) if i not in drop]
+
+
 # =============================================================================
 # Traffic Learner
 # =============================================================================
@@ -165,7 +405,7 @@ class TrafficLearner:
         agent_type: str = "unknown",
         max_history: int = 20,
         dedup_window: int = 100,
-        min_evidence: int = 2,
+        min_evidence: int = 5,
     ) -> None:
         """Initialize the traffic learner.
 
@@ -332,10 +572,16 @@ class TrafficLearner:
         if not patterns:
             return
 
-        # Evidence gate: at shutdown accept single-evidence rows; during live
-        # flushes require 2+ to suppress one-off noise.
-        min_evidence = 1 if self._stopping else 2
-        patterns = [p for p in patterns if p.evidence_count >= min_evidence]
+        # Evidence gate: require self._min_evidence corroborations to flush,
+        # including at shutdown. One-shot singletons are noise, not signal.
+        patterns = [p for p in patterns if p.evidence_count >= self._min_evidence]
+        if not patterns:
+            return
+
+        # Drop A→B / B→A contradictions among error_recovery patterns.
+        # Both directions appearing with enough evidence usually means
+        # opposite-direction typos in different sessions, not stable advice.
+        patterns = _drop_contradictions(patterns)
         if not patterns:
             return
 
@@ -389,6 +635,7 @@ class TrafficLearner:
         Evidence counts are summed across duplicates.
         """
         by_hash: dict[str, ExtractedPattern] = {}
+        now = datetime.now(timezone.utc)
 
         # Persisted rows from memory.db
         db_path = _resolve_backend_db_path(self._backend)
@@ -404,11 +651,15 @@ class TrafficLearner:
                 else:
                     by_hash[p.content_hash] = p
 
-        # In-memory accumulator (patterns not yet persisted)
+        # In-memory accumulator (patterns not yet persisted). Re-sightings in
+        # this session bump last_seen_at to "now" on top of the persisted
+        # timestamp so recency ranking reflects live activity.
         for pattern, count in self._pattern_counts.values():
             h = pattern.content_hash
             if h in by_hash:
-                by_hash[h].evidence_count += count
+                existing = by_hash[h]
+                existing.evidence_count += count
+                existing.last_seen_at = now
             else:
                 by_hash[h] = ExtractedPattern(
                     category=pattern.category,
@@ -418,6 +669,8 @@ class TrafficLearner:
                     entity_refs=list(pattern.entity_refs),
                     metadata=dict(pattern.metadata),
                     content_hash=pattern.content_hash,
+                    first_seen_at=now,
+                    last_seen_at=now,
                 )
 
         return list(by_hash.values())
@@ -569,17 +822,24 @@ class TrafficLearner:
         elif tool == "Read":
             error_path = error_entry["input"].get("file_path", "")
             success_path = success_entry["input"].get("file_path", "")
-            if error_path and success_path and error_path != success_path:
-                content = (
-                    f"File `{error_path}` does not exist. The correct path is `{success_path}`."
-                )
-                return ExtractedPattern(
-                    category=PatternCategory.ERROR_RECOVERY,
-                    content=content,
-                    importance=0.7,
-                    entity_refs=[success_path],
-                    metadata={"error_category": error_cat},
-                )
+            # Reject pairs whose basenames don't look like typos of each
+            # other — different files in the same directory are unrelated
+            # reads, not a recovery, and emitting a rule is actively wrong.
+            if not _paths_related_as_typo(error_path, success_path):
+                return None
+            content = f"File `{error_path}` does not exist. The correct path is `{success_path}`."
+            return ExtractedPattern(
+                category=PatternCategory.ERROR_RECOVERY,
+                content=content,
+                importance=0.7,
+                entity_refs=[success_path],
+                metadata={
+                    "error_category": error_cat,
+                    "tool": "Read",
+                    "error_path": error_path,
+                    "success_path": success_path,
+                },
+            )
         elif tool in ("Grep", "Glob"):
             error_pattern = error_entry["input"].get("pattern", "")
             success_pattern = success_entry["input"].get("pattern", "")
@@ -606,6 +866,13 @@ class TrafficLearner:
         error_cat = error_entry.get("error_category", "unknown")
 
         if not failed_cmd or not success_cmd or failed_cmd == success_cmd:
+            return None
+        # Require the two commands to look like the same operation retried.
+        # Without this, any failed Bash followed by any Bash success in the
+        # last 5 calls becomes a "use Y instead of X" rule, even when X and
+        # Y are unrelated (e.g. two grep calls with different needles and
+        # different files).
+        if not _commands_related_as_retry(failed_cmd, success_cmd):
             return None
 
         # Determine importance based on error category
@@ -635,7 +902,12 @@ class TrafficLearner:
             content=content,
             importance=importance,
             entity_refs=entities,
-            metadata={"error_category": error_cat, "failed_cmd": failed_short},
+            metadata={
+                "error_category": error_cat,
+                "tool": "Bash",
+                "failed_cmd": failed_short,
+                "success_cmd": success_short,
+            },
         )
 
     def _extract_environment(self, entry: dict[str, Any]) -> list[ExtractedPattern]:
@@ -679,35 +951,227 @@ class TrafficLearner:
 
         return patterns
 
+    # ---------------------------------------------------------------
+    # Preference detection (GH #464)
+    # ---------------------------------------------------------------
+    # The detector is regex-free on purpose. The previous regex-based
+    # implementation matched scaffolding ("don't mention this
+    # reminder…" injected by Claude Code's system-reminder blocks) and
+    # produced mid-sentence truncations because ``.{10,100}`` captured
+    # an arbitrary 100-char window with no boundary awareness. A
+    # tokenized scanner is easier to reason about, doesn't suffer
+    # catastrophic-backtracking edge cases, and lets us layer
+    # boundary rules (sentence terminator / end-of-input / max-length)
+    # without nesting more pattern syntax.
+
+    # Each entry is a sequence of lowercase tokens that must appear
+    # in order with whitespace / single-comma separation. ``max_chars``
+    # caps how much content we'll capture after the last trigger
+    # token. The "instead" trigger gets a tighter cap because in
+    # practice its tail tends to be shorter and we want to be less
+    # forgiving of long rambles after it.
+    _PREFERENCE_TRIGGERS: ClassVar[tuple[tuple[tuple[str, ...], int], ...]] = (
+        (("don't",), 98),
+        (("dont",), 98),
+        (("do", "not"), 98),
+        (("stop",), 98),
+        (("never",), 98),
+        (("avoid",), 98),
+        (("no", "use"), 98),
+        (("no", "try"), 98),
+        (("no", "do"), 98),
+        (("instead",), 78),
+    )
+
+    # Characters that mark the end of the captured preference.
+    _SENTENCE_TERMINATORS: ClassVar[frozenset[str]] = frozenset(".!?\n")
+
+    # Characters allowed between the trigger and the start of the
+    # capture (e.g. the comma in "No, use httpx").
+    _PRE_CAPTURE_PUNCT: ClassVar[frozenset[str]] = frozenset(",;:")
+
+    # Characters stripped from individual tokens before trigger
+    # matching ("don't," → "don't"; "stop." → "stop"). Whitespace is
+    # handled separately by the tokenizer.
+    _TOKEN_STRIP_CHARS: ClassVar[str] = ",.;:!?\"'()[]{}"
+
     def _extract_preferences(self, user_text: str) -> list[ExtractedPattern]:
         """Extract preference signals from user messages.
 
-        Looks for correction patterns: "no", "don't", "instead", "use X not Y".
-        """
-        patterns: list[ExtractedPattern] = []
+        Defends against GH #464 noise sources:
 
-        # Negative corrections: "don't X", "stop X", "no, X"
-        correction_res = [
-            re.compile(r"(?:don'?t|do not|stop|never|avoid)\s+(.{10,100})", re.I),
-            re.compile(r"(?:no,?\s+)(?:use|try|do)\s+(.{10,100})", re.I),
-            re.compile(r"instead(?:,?\s+)(.{10,80})", re.I),
+        * Claude Code (and other agent harnesses) inject
+          ``<system-reminder>…</system-reminder>`` blocks into user-role
+          message bodies. Their content is *not* user-stated
+          preferences ("don't mention this reminder", "use colgrep
+          instead of Grep") but the old correction regexes matched
+          them. We strip those blocks first so reminders never feed
+          the learner.
+        * The capture used to be a fixed-length window which produced
+          mid-sentence truncations. The token-based scanner below
+          ends each capture at a sentence terminator OR at
+          end-of-input, and rejects anything that would require
+          truncation past ``max_chars``.
+        """
+
+        cleaned = self._strip_system_reminders(user_text)[:500]
+        correction = self._find_correction(cleaned)
+        if correction is None:
+            return []
+
+        return [
+            ExtractedPattern(
+                category=PatternCategory.PREFERENCE,
+                content=f"User preference: {correction}",
+                importance=0.75,
+                metadata={"type": "correction", "source_text": cleaned[:200]},
+            )
         ]
 
-        for regex in correction_res:
-            match = regex.search(user_text[:500])
-            if match:
-                correction = match.group(1).strip().rstrip(".")
-                patterns.append(
-                    ExtractedPattern(
-                        category=PatternCategory.PREFERENCE,
-                        content=f"User preference: {correction}",
-                        importance=0.75,
-                        metadata={"type": "correction", "source_text": user_text[:200]},
-                    )
-                )
-                break  # One preference per message
+    @classmethod
+    def _find_correction(cls, text: str) -> str | None:
+        """Return the captured preference content or ``None``.
 
-        return patterns
+        Walks the input once, tokenising on whitespace. At every
+        token position we try each trigger sequence in priority
+        order; the first satisfied trigger wins.
+        """
+
+        tokens = cls._tokenize(text)
+        if not tokens:
+            return None
+
+        for trigger_idx in range(len(tokens)):
+            for sequence, max_chars in cls._PREFERENCE_TRIGGERS:
+                if not cls._matches_sequence(tokens, trigger_idx, sequence):
+                    continue
+                last_token_end = tokens[trigger_idx + len(sequence) - 1][2]
+                captured = cls._capture_after(text, last_token_end, max_chars)
+                if captured is None:
+                    continue
+                return captured
+        return None
+
+    @classmethod
+    def _matches_sequence(
+        cls,
+        tokens: list[tuple[str, int, int]],
+        start: int,
+        sequence: tuple[str, ...],
+    ) -> bool:
+        if start + len(sequence) > len(tokens):
+            return False
+        for offset, expected in enumerate(sequence):
+            actual_token = tokens[start + offset][0]
+            normalised = actual_token.strip(cls._TOKEN_STRIP_CHARS)
+            if normalised != expected:
+                return False
+        return True
+
+    @classmethod
+    def _capture_after(
+        cls,
+        text: str,
+        capture_after_pos: int,
+        max_chars: int,
+    ) -> str | None:
+        """Capture up to ``max_chars`` of content starting at the first
+        non-whitespace, non-pre-punct character after ``capture_after_pos``.
+
+        Returns ``None`` when the capture would have to truncate past
+        ``max_chars`` without hitting a sentence terminator or
+        end-of-input. Returns ``None`` for captures shorter than 10
+        chars (those are noise — likely a stray trigger word with no
+        real correction following it).
+        """
+
+        n = len(text)
+        cap_start = capture_after_pos
+        while cap_start < n and (
+            text[cap_start].isspace() or text[cap_start] in cls._PRE_CAPTURE_PUNCT
+        ):
+            cap_start += 1
+
+        cap_end = cap_start
+        while (
+            cap_end < n
+            and (cap_end - cap_start) < max_chars
+            and text[cap_end] not in cls._SENTENCE_TERMINATORS
+        ):
+            cap_end += 1
+
+        length = cap_end - cap_start
+        if length < 10:
+            return None
+
+        # If we hit ``max_chars`` without finding a terminator and the
+        # text continues past us, this is a rambling fragment — reject.
+        if length >= max_chars and cap_end < n and text[cap_end] not in cls._SENTENCE_TERMINATORS:
+            return None
+
+        captured = text[cap_start:cap_end].strip()
+        captured = captured.rstrip("".join(cls._SENTENCE_TERMINATORS)).strip()
+        return captured or None
+
+    @staticmethod
+    def _tokenize(text: str) -> list[tuple[str, int, int]]:
+        """Whitespace-split tokenizer.
+
+        Returns ``[(lower_token, start, end), …]``. Positions are byte
+        offsets into the original string so callers can resume
+        scanning from the end of a token. Tokens are lowercased once,
+        up front, so trigger comparisons don't have to call
+        ``.lower()`` per match.
+        """
+
+        out: list[tuple[str, int, int]] = []
+        i = 0
+        n = len(text)
+        while i < n:
+            while i < n and text[i].isspace():
+                i += 1
+            start = i
+            while i < n and not text[i].isspace():
+                i += 1
+            if i > start:
+                out.append((text[start:i].lower(), start, i))
+        return out
+
+    @staticmethod
+    def _strip_system_reminders(text: str) -> str:
+        """Remove ``<system-reminder>…</system-reminder>`` blocks from text.
+
+        Uses a literal scan (``str.find``) rather than a regex so the
+        matcher cannot accidentally pick up unrelated ``<*>``-shaped
+        content. Unclosed reminders (missing ``</system-reminder>``)
+        are dropped to end-of-string — the agent harness writes
+        balanced tags, and an unbalanced one is corrupt input we
+        shouldn't index. Matching is case-insensitive on the tag name.
+        """
+        if not text or "<" not in text:
+            return text
+
+        open_tag = "<system-reminder"
+        close_tag = "</system-reminder>"
+
+        lower = text.lower()
+        out: list[str] = []
+        cursor = 0
+        n = len(text)
+        while cursor < n:
+            start = lower.find(open_tag, cursor)
+            if start < 0:
+                out.append(text[cursor:])
+                break
+            out.append(text[cursor:start])
+            tag_end = text.find(">", start)
+            if tag_end < 0:
+                break
+            close_start = lower.find(close_tag, tag_end + 1)
+            if close_start < 0:
+                break
+            cursor = close_start + len(close_tag)
+        return "".join(out)
 
     # =========================================================================
     # Pattern Accumulation & Persistence
@@ -762,6 +1226,7 @@ class TrafficLearner:
                 if self._backend is None:
                     continue
 
+                now_iso = datetime.now(timezone.utc).isoformat()
                 memory = await self._backend.save_memory(
                     content=pattern.content,
                     user_id=self._user_id,
@@ -770,6 +1235,8 @@ class TrafficLearner:
                         "source": "traffic_learner",
                         "category": pattern.category.value,
                         "evidence_count": pattern.evidence_count,
+                        "first_seen_at": now_iso,
+                        "last_seen_at": now_iso,
                         **pattern.metadata,
                     },
                 )
@@ -796,7 +1263,7 @@ class TrafficLearner:
         if db_path is None or not db_path.exists():
             return
 
-        def _read() -> list[tuple[str, str]]:
+        def _read() -> list[tuple[str, str, str]]:
             uri = f"file:{db_path}?mode=ro"
             try:
                 conn = sqlite3.connect(uri, uri=True)
@@ -804,7 +1271,7 @@ class TrafficLearner:
                 return []
             try:
                 rows = conn.execute(
-                    "SELECT id, content FROM memories "
+                    "SELECT id, content, metadata FROM memories "
                     "WHERE json_extract(metadata, '$.source') = 'traffic_learner'"
                 ).fetchall()
             except sqlite3.DatabaseError:
@@ -814,7 +1281,7 @@ class TrafficLearner:
                     conn.close()
                 except Exception:
                     pass
-            return [(row[0], row[1] or "") for row in rows]
+            return [(row[0], row[1] or "", row[2] or "{}") for row in rows]
 
         try:
             rows = await asyncio.to_thread(_read)
@@ -822,10 +1289,24 @@ class TrafficLearner:
             logger.debug("Traffic learner hydrate failed: %s", e)
             return
 
-        for memory_id, content in rows:
+        for memory_id, content, metadata_json in rows:
             if not content:
                 continue
-            h = hashlib.sha256(content.encode()).hexdigest()[:16]
+            try:
+                metadata = json.loads(metadata_json) if metadata_json else {}
+            except json.JSONDecodeError:
+                metadata = {}
+            category_value = metadata.get("category")
+            try:
+                category = PatternCategory(category_value) if category_value else None
+            except ValueError:
+                category = None
+            if category is None:
+                # Legacy row without category — fall back to literal hash.
+                key = content
+            else:
+                key = _normalize_hash_key(category, content, metadata)
+            h = hashlib.sha256(key.encode()).hexdigest()[:16]
             self._saved_hashes.add(h)
             # If multiple rows share the same content (legacy duplicates),
             # last-wins — we only need one id to target the bump.
@@ -837,15 +1318,18 @@ class TrafficLearner:
         if db_path is None or not db_path.exists():
             return
 
+        now_iso = datetime.now(timezone.utc).isoformat()
+
         def _bump() -> None:
             conn = sqlite3.connect(str(db_path))
             try:
                 conn.execute(
                     "UPDATE memories SET metadata = json_set("
                     "metadata, '$.evidence_count', "
-                    "COALESCE(json_extract(metadata, '$.evidence_count'), 0) + 1"
+                    "COALESCE(json_extract(metadata, '$.evidence_count'), 0) + 1, "
+                    "'$.last_seen_at', ?"
                     ") WHERE id = ?",
-                    (memory_id,),
+                    (now_iso, memory_id),
                 )
                 conn.commit()
             finally:
@@ -964,7 +1448,7 @@ def _project_for_pattern(pattern: ExtractedPattern, roots: list[ProjectInfo]) ->
 
     for cand in candidates:
         for root in roots_sorted:
-            root_str = str(root.project_path).rstrip("/")
+            root_str = str(root.project_path).rstrip("/\\")
             if not root_str:
                 continue
             if (
@@ -1007,7 +1491,7 @@ def _load_persisted_patterns_from_sqlite(db_path: Path) -> list[ExtractedPattern
     try:
         conn.row_factory = sqlite3.Row
         rows = conn.execute(
-            "SELECT content, metadata, entity_refs, importance "
+            "SELECT content, metadata, entity_refs, importance, created_at "
             "FROM memories "
             "WHERE json_extract(metadata, '$.source') = 'traffic_learner'"
         ).fetchall()
@@ -1045,12 +1529,24 @@ def _load_persisted_patterns_from_sqlite(db_path: Path) -> list[ExtractedPattern
         except (TypeError, ValueError):
             importance = 0.5
 
-        h = hashlib.sha256(content.encode()).hexdigest()[:16]
+        first_seen = _parse_iso_timestamp(meta.get("first_seen_at")) or _parse_iso_timestamp(
+            row["created_at"]
+        )
+        last_seen = _parse_iso_timestamp(meta.get("last_seen_at")) or first_seen
+
+        key = _normalize_hash_key(category, content, meta)
+        h = hashlib.sha256(key.encode()).hexdigest()[:16]
         if h in patterns:
             existing = patterns[h]
             existing.evidence_count += evidence
             if importance > existing.importance:
                 existing.importance = importance
+            if last_seen and (existing.last_seen_at is None or last_seen > existing.last_seen_at):
+                existing.last_seen_at = last_seen
+            if first_seen and (
+                existing.first_seen_at is None or first_seen < existing.first_seen_at
+            ):
+                existing.first_seen_at = first_seen
         else:
             patterns[h] = ExtractedPattern(
                 category=category,
@@ -1060,9 +1556,24 @@ def _load_persisted_patterns_from_sqlite(db_path: Path) -> list[ExtractedPattern
                 entity_refs=list(entity_refs),
                 metadata=meta,
                 content_hash=h,
+                first_seen_at=first_seen,
+                last_seen_at=last_seen,
             )
 
     return list(patterns.values())
+
+
+def _parse_iso_timestamp(value: Any) -> datetime | None:
+    """Parse an ISO-8601 timestamp stored as TEXT. Returns None on any failure."""
+    if not value or not isinstance(value, str):
+        return None
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed
 
 
 def _patterns_to_recommendations(patterns: list[ExtractedPattern]) -> list:
@@ -1086,8 +1597,13 @@ def _patterns_to_recommendations(patterns: list[ExtractedPattern]) -> list:
             if target_str == "context_file"
             else RecommendationTarget.MEMORY_FILE
         )
-        # Sort by evidence_count desc so the most-supported rules appear first.
-        items.sort(key=lambda p: p.evidence_count, reverse=True)
+        if category is PatternCategory.ERROR_RECOVERY:
+            items = _refine_error_recovery(items)
+        else:
+            # Sort by evidence_count desc so the most-supported rules appear first.
+            items.sort(key=lambda p: p.evidence_count, reverse=True)
+        if not items:
+            continue
         bullets = "\n".join(f"- {p.content}" for p in items)
         recs.append(
             Recommendation(
@@ -1099,3 +1615,99 @@ def _patterns_to_recommendations(patterns: list[ExtractedPattern]) -> list:
             )
         )
     return recs
+
+
+def _refine_error_recovery(patterns: list[ExtractedPattern]) -> list[ExtractedPattern]:
+    """Apply the render-time pipeline for error_recovery patterns.
+
+    Pipeline: hard-floor drop by last_seen_at, re-validate Read success
+    paths against the filesystem, collapse ambiguous error_paths into a
+    single "search first" hint, rank by recency-weighted evidence, and
+    cap the section at _ERROR_RECOVERY_SECTION_CAP bullets.
+    """
+    now = datetime.now(timezone.utc)
+
+    # 1. Hard floor — drop rows not re-observed in the last N days.
+    alive: list[ExtractedPattern] = []
+    for p in patterns:
+        last_seen = p.last_seen_at or p.first_seen_at
+        if last_seen is None:
+            # No timestamp — treat as just-seen so it survives one render.
+            alive.append(p)
+            continue
+        age_days = (now - last_seen).total_seconds() / 86400.0
+        if age_days <= _ERROR_RECOVERY_HARD_FLOOR_DAYS:
+            alive.append(p)
+
+    # 2. Re-validate Read recoveries — drop if success_path no longer exists.
+    validated: list[ExtractedPattern] = []
+    for p in alive:
+        if p.metadata.get("tool") == "Read":
+            success_path = p.metadata.get("success_path")
+            if success_path:
+                try:
+                    if not Path(success_path).exists():
+                        continue
+                except OSError:
+                    # Path check failed (permissions, etc.) — keep the row
+                    # rather than drop on a transient error.
+                    pass
+        validated.append(p)
+
+    # 3. Collision-collapse — same error_path with >=2 distinct success_paths
+    #    is an ambiguity signal, not N separate lessons. Replace the group
+    #    with one synthesized "search first" bullet.
+    read_groups: dict[str, list[ExtractedPattern]] = {}
+    others: list[ExtractedPattern] = []
+    for p in validated:
+        if p.metadata.get("tool") == "Read" and p.metadata.get("error_path"):
+            read_groups.setdefault(p.metadata["error_path"], []).append(p)
+        else:
+            others.append(p)
+
+    collapsed: list[ExtractedPattern] = list(others)
+    for error_path, group in read_groups.items():
+        distinct_targets = {g.metadata.get("success_path") for g in group}
+        distinct_targets.discard(None)
+        if len(group) >= 2 and len(distinct_targets) >= 2:
+            basename = os.path.basename(error_path) or error_path
+            synth_content = (
+                f"Path `{basename}` has been guessed wrong repeatedly — "
+                f"use Glob/Grep to locate before reading."
+            )
+            max_last_seen = max(
+                (g.last_seen_at for g in group if g.last_seen_at),
+                default=now,
+            )
+            collapsed.append(
+                ExtractedPattern(
+                    category=PatternCategory.ERROR_RECOVERY,
+                    content=synth_content,
+                    importance=max(g.importance for g in group),
+                    evidence_count=sum(g.evidence_count for g in group),
+                    metadata={
+                        "tool": "Read",
+                        "error_path": error_path,
+                        "collapsed": True,
+                    },
+                    last_seen_at=max_last_seen,
+                    first_seen_at=min(
+                        (g.first_seen_at for g in group if g.first_seen_at),
+                        default=max_last_seen,
+                    ),
+                )
+            )
+        else:
+            collapsed.extend(group)
+
+    # 4. Recency-weighted score.
+    def _score(p: ExtractedPattern) -> float:
+        last_seen = p.last_seen_at or p.first_seen_at or now
+        age_days = max(0.0, (now - last_seen).total_seconds() / 86400.0)
+        decay = float(0.5 ** (age_days / _ERROR_RECOVERY_HALF_LIFE_DAYS))
+        return float(p.evidence_count) * decay
+
+    collapsed.sort(key=_score, reverse=True)
+
+    # 5. Cap the section.
+    return collapsed[:_ERROR_RECOVERY_SECTION_CAP]

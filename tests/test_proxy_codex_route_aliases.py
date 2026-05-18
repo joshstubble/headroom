@@ -157,3 +157,80 @@ def test_codex_responses_subpath_passthrough_derives_chatgpt_routing_from_jwt(pa
     assert url == expected_url
     assert headers["authorization"] == f"Bearer {token}"
     assert headers["ChatGPT-Account-ID"] == "acct-from-jwt"
+
+
+def test_codex_model_metadata_synthesises_response_for_chatgpt_auth():
+    """Issue #478: under Codex ChatGPT-subscription OAuth, the proxy
+    must NOT forward `/v1/models[/{id}]` to chatgpt.com/backend-api —
+    that endpoint returns 403 to OAuth tokens, breaking Codex's model
+    refresh. Headroom synthesises an OpenAI-compatible payload locally
+    so the picker UI populates correctly.
+
+    The earlier version of this test asserted the buggy forward
+    behaviour; flipped here to lock the synthetic-response contract
+    so the bug can't return.
+    """
+
+    class FakeAsyncClient:
+        def __init__(self):
+            self.calls: list[tuple[str, str, dict[str, str]]] = []
+
+        async def request(self, method, url, **kwargs):  # type: ignore[no-untyped-def]
+            self.calls.append((method, url, dict(kwargs.get("headers", {}))))
+            return httpx.Response(200, json={"method": method, "url": url})
+
+        async def aclose(self):
+            return None
+
+    token = _jwt(
+        {
+            "https://api.openai.com/auth": {
+                "chatgpt_account_id": "acct-from-jwt",
+            }
+        }
+    )
+
+    with TestClient(create_app(ProxyConfig())) as client:
+        fake_http_client = FakeAsyncClient()
+        client.app.state.proxy.http_client = fake_http_client
+        client.app.state.proxy.OPENAI_API_URL = "https://api.openai.test"
+
+        list_response = client.get(
+            "/v1/models?client_version=0.130.0",
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        known_response = client.get(
+            "/v1/models/gpt-5.5",
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        unknown_response = client.get(
+            "/v1/models/gpt-5.3-codex?client_version=0.130.0",
+            headers={"Authorization": f"Bearer {token}"},
+        )
+
+    # No upstream call must be made — the response is synthesised locally.
+    assert fake_http_client.calls == [], (
+        f"Expected zero upstream calls; got {fake_http_client.calls}"
+    )
+
+    # List endpoint returns a non-empty OpenAI-compatible list.
+    assert list_response.status_code == 200
+    list_payload = list_response.json()
+    assert list_payload["object"] == "list"
+    assert isinstance(list_payload["data"], list)
+    assert len(list_payload["data"]) > 0
+    assert "gpt-5.5" in {entry["id"] for entry in list_payload["data"]}
+
+    # Single-model GET returns a model object when known.
+    assert known_response.status_code == 200
+    known_payload = known_response.json()
+    assert known_payload == {
+        "id": "gpt-5.5",
+        "object": "model",
+        "created": 0,
+        "owned_by": "openai",
+    }
+
+    # Unknown model variants 404 — the synthetic set is bounded to the
+    # ChatGPT-auth-supported list.
+    assert unknown_response.status_code == 404
