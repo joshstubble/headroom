@@ -27,6 +27,8 @@ from headroom.pipeline import PipelineStage, summarize_routing_markers
 from headroom.proxy.auth_mode import classify_auth_mode, classify_client
 from headroom.proxy.compression_decision import CompressionDecision
 from headroom.proxy.helpers import extract_tags
+from headroom.proxy.memory_decision import MemoryDecision
+from headroom.proxy.memory_query import MemoryQuery
 from headroom.proxy.outcome import RequestOutcome
 
 logger = logging.getLogger("headroom.proxy")
@@ -688,6 +690,23 @@ class AnthropicHandlerMixin:
                     ),
                 )
 
+            # Canonical memory-injection gate. Reads `request.headers`
+            # so bypass detection sees the original inbound (the local
+            # `headers` dict was stripped of x-headroom-* above).
+            # Replaces the pre-PR-this raw `if self.memory_handler and
+            # memory_user_id:` conjunction that silently ignored
+            # `x-headroom-bypass: true` and mutated request bytes
+            # under the user's "don't touch my bytes" signal.
+            from headroom.proxy.helpers import get_memory_injection_mode
+
+            memory_decision = MemoryDecision.decide(
+                headers=request.headers,
+                memory_handler=self.memory_handler,
+                memory_user_id=memory_user_id,
+                mode_name=get_memory_injection_mode(),
+            )
+            memory_decision.apply_to_tags(tags)
+
             # Check cache (non-streaming only)
             cache_hit = False
             if self.cache and not stream:
@@ -864,12 +883,18 @@ class AnthropicHandlerMixin:
             # turn becomes historical on the next request, so even "latest turn only"
             # rewrites can invalidate the next cache read when the client resends the
             # original transcript.
-            if (
-                self.config.image_optimize
-                and messages
-                and not _bypass
-                and not is_cache_mode(self.config.mode)
-            ):
+            #
+            # Bypass / image_optimize / messages gating routes through
+            # ImageCompressionDecision for uniformity with CompressionDecision +
+            # MemoryDecision. The cache_mode check stays inline because it's
+            # Anthropic-specific (sites in openai.py / gemini.py don't have it).
+            from headroom.proxy.image_compression_decision import ImageCompressionDecision
+
+            _image_decision = ImageCompressionDecision.decide(
+                headers=request.headers, config=self.config, messages=messages
+            )
+            _image_decision.apply_to_tags(tags)
+            if _image_decision.should_compress and not is_cache_mode(self.config.mode):
                 compressor = None
                 try:
                     compressor = _get_image_compressor()
@@ -1297,10 +1322,15 @@ class AnthropicHandlerMixin:
                 except Exception as e:
                     logger.debug(f"[{request_id}] Traffic learner: {e}")
 
-            # Memory: Inject context and tools
+            # Memory: Inject context and tools — gated on MemoryDecision.
+            # ``inject`` is False under bypass, missing handler, missing
+            # user_id, or HEADROOM_MEMORY_INJECTION_MODE in disabled/tool.
+            # Pre-PR-this the gate was a raw conjunction that silently
+            # ignored bypass; now bypass is honoured here on Anthropic
+            # /v1/messages just as on /v1/responses.
             memory_context_injected = False
             memory_tools_injected = False
-            if self.memory_handler and memory_user_id:
+            if memory_decision.inject:
                 # Search and inject memory context
                 if self.memory_handler.config.inject_context:
                     try:
@@ -1310,6 +1340,7 @@ class AnthropicHandlerMixin:
                                     memory_user_id,
                                     optimized_messages,
                                     request_context=memory_request_ctx,
+                                    query=MemoryQuery.from_messages(optimized_messages),
                                 ),
                                 timeout=(
                                     self.config.anthropic_pre_upstream_memory_context_timeout_seconds
